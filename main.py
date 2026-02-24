@@ -1,5 +1,6 @@
 import os
 import time
+import math
 import asyncio
 import sqlite3
 from dataclasses import dataclass
@@ -7,299 +8,156 @@ from typing import List, Optional, Tuple, Dict
 
 import httpx
 from dotenv import load_dotenv
-
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+# ================= CONFIG =================
 
-# =========================
-# ENV / CONFIG
-# =========================
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
-ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW.isdigit() else 0
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing. Set it in Railway Variables.")
+    raise RuntimeError("BOT_TOKEN missing")
 
 BINANCE = "https://api.binance.com"
 DB_PATH = "signals.db"
 
-TOP_N = 100
-MIN_QUOTE_VOL_USDT_24H = 50_000_000.0
+TOP_N = 50
+DAILY_LIMIT = 10
+MAX_LOSS_STREAK = 3
+
+MIN_VOLUME = 50_000_000
 MIN_PRICE = 0.01
 
-AUTO_SCAN_EVERY_MIN = 15
-TOPLIST_CACHE_TTL = 30 * 60  # 30 min
+EVAL_BARS = 3
+AUTO_INTERVAL = 15
+TKM_OFFSET = 5 * 3600
 
-# Winrate engine
-EVAL_INTERVAL = "5m"
-EVAL_BARS = 3            # evaluate after N 5m bars
-EVAL_LOOP_SECONDS = 30   # how often to check pending
+bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+dp = Dispatcher()
 
-# Signal model (simple базовый вход, без лимиток)
-TP_PCT = 1.0
-SL_PCT = 0.5
+# ================= DATABASE =================
 
-# If neither TP nor SL hit in window -> treat as LOSE (no NEUTRAL)
-FORCE_BINARY_RESULT = True
-
-# HTTP concurrency
-HTTP_SEM = asyncio.Semaphore(6)
-HTTP_CLIENT: Optional[httpx.AsyncClient] = None
-
-
-# =========================
-# DB
-# =========================
-def db() -> sqlite3.Connection:
+def db():
     return sqlite3.connect(DB_PATH)
 
-def db_init():
+def init_db():
     con = db()
     cur = con.cursor()
 
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS users(
-            user_id INTEGER PRIMARY KEY,
-            created_ts INTEGER NOT NULL,
-            status TEXT NOT NULL DEFAULT 'PENDING', -- PENDING/APPROVED/BANNED
-            access_until INTEGER NOT NULL DEFAULT 0,
-            autoscan INTEGER NOT NULL DEFAULT 1
-        );
-    """)
+    CREATE TABLE IF NOT EXISTS users(
+        user_id INTEGER PRIMARY KEY,
+        status TEXT DEFAULT 'PENDING',
+        access_until INTEGER DEFAULT 0,
+        autoscan INTEGER DEFAULT 1,
+        mode TEXT DEFAULT 'STRICT'
+    )""")
 
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS access_requests(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            status TEXT NOT NULL DEFAULT 'PENDING' -- PENDING/APPROVED/REJECTED
-        );
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS signals(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            symbol TEXT NOT NULL,
-            side TEXT NOT NULL,         -- LONG/SHORT
-            entry REAL NOT NULL,
-            tp REAL NOT NULL,
-            sl REAL NOT NULL,
-            score INTEGER NOT NULL,
-            eval_bars INTEGER NOT NULL,
-            status TEXT NOT NULL DEFAULT 'PENDING', -- PENDING/WIN/LOSE
-            resolved_ts INTEGER,
-            resolved_price REAL
-        );
-    """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_pending ON signals(status, ts);")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_user ON signals(user_id, ts);")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol ON signals(symbol, ts);")
+    CREATE TABLE IF NOT EXISTS signals(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER,
+        user_id INTEGER,
+        symbol TEXT,
+        side TEXT,
+        entry REAL,
+        tp REAL,
+        sl REAL,
+        status TEXT DEFAULT 'PENDING'
+    )""")
 
     con.commit()
     con.close()
 
-def ensure_user(user_id: int):
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
-    if not cur.fetchone():
-        cur.execute(
-            "INSERT INTO users(user_id, created_ts, status, access_until, autoscan) VALUES(?,?,?,?,?)",
-            (user_id, int(time.time()), "PENDING", 0, 1)
-        )
+def ensure_user(uid):
+    con=db()
+    cur=con.cursor()
+    cur.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)",(uid,))
     con.commit()
     con.close()
 
-def get_user(user_id: int) -> dict:
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT user_id, status, access_until, autoscan FROM users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
+def active(uid):
+    con=db()
+    cur=con.cursor()
+    cur.execute("SELECT status,access_until FROM users WHERE user_id=?",(uid,))
+    r=cur.fetchone()
     con.close()
-    if not row:
-        return {"user_id": user_id, "status": "PENDING", "access_until": 0, "autoscan": 1}
-    return {"user_id": row[0], "status": row[1], "access_until": row[2], "autoscan": row[3]}
-
-def set_autoscan(user_id: int, enabled: bool):
-    con = db()
-    cur = con.cursor()
-    cur.execute("UPDATE users SET autoscan=? WHERE user_id=?", (1 if enabled else 0, user_id))
-    con.commit()
-    con.close()
-
-def is_access_active(user_id: int) -> Tuple[bool, int]:
-    u = get_user(user_id)
-    now = int(time.time())
-    return (u["status"] == "APPROVED" and int(u["access_until"]) > now), int(u["access_until"])
-
-def create_request(user_id: int) -> bool:
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT id FROM access_requests WHERE user_id=? AND status='PENDING' ORDER BY ts DESC LIMIT 1", (user_id,))
-    if cur.fetchone():
-        con.close()
+    if not r:
         return False
-    cur.execute("INSERT INTO access_requests(ts, user_id, status) VALUES(?,?, 'PENDING')", (int(time.time()), user_id))
-    con.commit()
-    con.close()
-    return True
+    return r[0]=="APPROVED" and r[1]>int(time.time())
 
-def approve_user(user_id: int, days: int) -> int:
-    until = int(time.time()) + days * 24 * 3600
-    con = db()
-    cur = con.cursor()
-    cur.execute("UPDATE users SET status='APPROVED', access_until=? WHERE user_id=?", (until, user_id))
-    cur.execute("UPDATE access_requests SET status='APPROVED' WHERE user_id=? AND status='PENDING'", (user_id,))
-    con.commit()
-    con.close()
-    return until
+# ================= INDICATORS =================
 
-def reject_user_request(user_id: int):
-    con = db()
-    cur = con.cursor()
-    cur.execute("UPDATE access_requests SET status='REJECTED' WHERE user_id=? AND status='PENDING'", (user_id,))
-    con.commit()
-    con.close()
+def ema(values, period):
+    alpha=2/(period+1)
+    result=[values[0]]
+    for v in values[1:]:
+        result.append(alpha*v+(1-alpha)*result[-1])
+    return result
 
-def db_add_signal(user_id: int, symbol: str, side: str, entry: float, tp: float, sl: float, score: int, eval_bars: int):
-    con = db()
-    cur = con.cursor()
-    cur.execute("""
-        INSERT INTO signals(ts, user_id, symbol, side, entry, tp, sl, score, eval_bars, status)
-        VALUES(?,?,?,?,?,?,?,?,?, 'PENDING')
-    """, (int(time.time()), user_id, symbol, side, float(entry), float(tp), float(sl), int(score), int(eval_bars)))
-    con.commit()
-    con.close()
+def rsi(values, period=14):
+    gains=[]
+    losses=[]
+    for i in range(1,len(values)):
+        diff=values[i]-values[i-1]
+        gains.append(max(diff,0))
+        losses.append(max(-diff,0))
+    avg_gain=sum(gains[:period])/period
+    avg_loss=sum(losses[:period])/period
+    rs=avg_gain/avg_loss if avg_loss!=0 else 0
+    rsi_vals=[100-(100/(1+rs))]
+    for i in range(period,len(gains)):
+        avg_gain=(avg_gain*(period-1)+gains[i])/period
+        avg_loss=(avg_loss*(period-1)+losses[i])/period
+        rs=avg_gain/avg_loss if avg_loss!=0 else 0
+        rsi_vals.append(100-(100/(1+rs)))
+    return [50]*(len(values)-len(rsi_vals))+rsi_vals
 
-def stats_total(user_id: int) -> Tuple[int, int, int, float, int]:
-    """
-    Returns (win, lose, total_done, winrate%, pending)
-    """
-    con = db()
-    cur = con.cursor()
-    cur.execute("""
-        SELECT
-          SUM(CASE WHEN status='WIN' THEN 1 ELSE 0 END),
-          SUM(CASE WHEN status='LOSE' THEN 1 ELSE 0 END),
-          SUM(CASE WHEN status='PENDING' THEN 1 ELSE 0 END),
-          COUNT(*)
-        FROM signals
-        WHERE user_id=?
-    """, (user_id,))
-    row = cur.fetchone()
-    con.close()
-    w = int(row[0] or 0)
-    l = int(row[1] or 0)
-    p = int(row[2] or 0)
-    total = int(row[3] or 0)
-    done = w + l
-    wr = (w / done * 100.0) if done > 0 else 0.0
-    return w, l, done, wr, p
+def atr(high,low,close,period=14):
+    trs=[]
+    for i in range(1,len(close)):
+        tr=max(high[i]-low[i],abs(high[i]-close[i-1]),abs(low[i]-close[i-1]))
+        trs.append(tr)
+    atr=sum(trs[:period])/period
+    atrs=[atr]
+    for i in range(period,len(trs)):
+        atr=(atr*(period-1)+trs[i])/period
+        atrs.append(atr)
+    return [0]*(len(close)-len(atrs))+atrs
+    # ================= BINANCE API =================
 
-def stats_by_coin(user_id: int, min_trades: int = 5, limit: int = 10) -> List[Tuple[str, int, float]]:
-    """
-    Top coins by winrate (only WIN/LOSE), min trades threshold.
-    """
-    con = db()
-    cur = con.cursor()
-    cur.execute("""
-        SELECT symbol,
-               SUM(CASE WHEN status='WIN' THEN 1 ELSE 0 END) AS w,
-               SUM(CASE WHEN status='LOSE' THEN 1 ELSE 0 END) AS l
-        FROM signals
-        WHERE user_id=? AND status IN ('WIN','LOSE')
-        GROUP BY symbol
-        HAVING (w + l) >= ?
-    """, (user_id, min_trades))
-    rows = cur.fetchall()
-    con.close()
-
-    out = []
-    for sym, w, l in rows:
-        w = int(w or 0)
-        l = int(l or 0)
-        t = w + l
-        wr = (w / t * 100.0) if t > 0 else 0.0
-        out.append((sym, t, wr))
-
-    out.sort(key=lambda x: (x[2], x[1]), reverse=True)
-    return out[:limit]
-
-
-# =========================
-# HTTP / BINANCE
-# =========================
-async def get_client() -> httpx.AsyncClient:
-    global HTTP_CLIENT
-    if HTTP_CLIENT is None:
-        HTTP_CLIENT = httpx.AsyncClient(timeout=15)
-    return HTTP_CLIENT
-
-async def http_get_json(url: str, params: Optional[dict] = None):
-    async with HTTP_SEM:
-        client = await get_client()
+async def fetch(url, params=None):
+    async with httpx.AsyncClient(timeout=15) as client:
         r = await client.get(url, params=params)
         r.raise_for_status()
         return r.json()
 
-def symbol_allowed(sym: str) -> bool:
-    if not sym.endswith("USDT"):
-        return False
-    bad_suffixes = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")
-    for s in bad_suffixes:
-        if sym.endswith(s):
-            return False
-    # exclude stable-like bases (optional)
-    base = sym[:-4]
-    if base in {"USDC", "TUSD", "FDUSD", "USDP", "DAI", "BUSD"}:
-        return False
-    return True
+async def klines(symbol, interval, limit=200):
+    return await fetch(
+        f"{BINANCE}/api/v3/klines",
+        {"symbol": symbol, "interval": interval, "limit": limit},
+    )
 
-TOPLIST_CACHE = {"ts": 0.0, "symbols": []}  # simple cache
-
-async def top_symbols() -> List[str]:
-    now = time.time()
-    if TOPLIST_CACHE["symbols"] and (now - TOPLIST_CACHE["ts"] < TOPLIST_CACHE_TTL):
-        return TOPLIST_CACHE["symbols"]
-
-    data = await http_get_json(f"{BINANCE}/api/v3/ticker/24hr")
+async def top_symbols():
+    data = await fetch(f"{BINANCE}/api/v3/ticker/24hr")
     arr = []
     for i in data:
-        sym = i.get("symbol", "")
-        if not symbol_allowed(sym):
+        s = i["symbol"]
+        if not s.endswith("USDT"):
             continue
-        try:
-            vol = float(i.get("quoteVolume", "0") or 0.0)
-            price = float(i.get("lastPrice", "0") or 0.0)
-        except Exception:
-            continue
-        if vol >= MIN_QUOTE_VOL_USDT_24H and price >= MIN_PRICE:
-            arr.append((sym, vol))
-
+        vol = float(i["quoteVolume"])
+        price = float(i["lastPrice"])
+        if vol >= MIN_VOLUME and price >= MIN_PRICE:
+            arr.append((s, vol))
     arr.sort(key=lambda x: x[1], reverse=True)
-    syms = [x[0] for x in arr[:TOP_N]]
+    return [x[0] for x in arr[:TOP_N]]
 
-    TOPLIST_CACHE["ts"] = now
-    TOPLIST_CACHE["symbols"] = syms
-    return syms
+# ================= ADVANCED STRATEGY =================
 
-async def klines(symbol: str, interval: str, start_ms: Optional[int] = None, limit: int = 100) -> List[list]:
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    if start_ms is not None:
-        params["startTime"] = start_ms
-    return await http_get_json(f"{BINANCE}/api/v3/klines", params=params)
-
-
-# =========================
-# SIGNAL LOGIC (simple)
-# =========================
 @dataclass
 class Signal:
     symbol: str
@@ -307,427 +165,305 @@ class Signal:
     entry: float
     tp: float
     sl: float
-    score: int
 
-async def build_signal(symbol: str) -> Optional[Signal]:
-    # Simple 15m momentum baseline
-    k = await klines(symbol, "15m", limit=60)
-    closes = [float(x[4]) for x in k]
-    if len(closes) < 3:
+async def build_advanced_signal(symbol, mode):
+    k1 = await klines(symbol, "1h", 250)
+    k15 = await klines(symbol, "15m", 250)
+    k5 = await klines(symbol, "5m", 100)
+
+    c1 = [float(x[4]) for x in k1]
+    c15 = [float(x[4]) for x in k15]
+    c5 = [float(x[4]) for x in k5]
+    h15 = [float(x[2]) for x in k15]
+    l15 = [float(x[3]) for x in k15]
+
+    ema50_1 = ema(c1,50)[-1]
+    ema200_1 = ema(c1,200)[-1]
+
+    ema50_15 = ema(c15,50)[-1]
+    ema200_15 = ema(c15,200)[-1]
+
+    rsi5 = rsi(c5)[-1]
+    atr15 = atr(h15,l15,c15)[-1]
+    atr_pct = atr15 / c15[-1] * 100
+
+    # STRICT vs BALANCED
+    min_atr = 0.25 if mode=="STRICT" else 0.15
+    rsi_filter = 55 if mode=="STRICT" else 50
+
+    if atr_pct < min_atr:
         return None
 
-    last = closes[-1]
-    prev = closes[-2]
+    trend_up = ema50_1 > ema200_1 and ema50_15 > ema200_15
+    trend_down = ema50_1 < ema200_1 and ema50_15 < ema200_15
 
-    score = 8
-    move = abs(last - prev) / last if last else 0.0
-    if move > 0.002:
-        score += 1
+    last = c5[-1]
+    prev = c5[-2]
 
-    if last > prev:
-        side = "LONG"
-        tp = last * (1 + TP_PCT / 100)
-        sl = last * (1 - SL_PCT / 100)
-    else:
-        side = "SHORT"
-        tp = last * (1 - TP_PCT / 100)
-        sl = last * (1 + SL_PCT / 100)
+    # confirmation: candle closed in direction
+    bullish = last > prev
+    bearish = last < prev
 
-    return Signal(symbol=symbol, side=side, entry=last, tp=tp, sl=sl, score=score)
+    if trend_up and bullish and rsi5 > rsi_filter:
+        tp = last * 1.01
+        sl = last * 0.995
+        return Signal(symbol,"LONG",last,tp,sl)
 
+    if trend_down and bearish and rsi5 < 100-rsi_filter:
+        tp = last * 0.99
+        sl = last * 1.005
+        return Signal(symbol,"SHORT",last,tp,sl)
 
-# =========================
-# EVALUATOR (WIN / LOSE only)
-# =========================
+    return None
+
+# ================= RISK CONTROL =================
+
+def today_key():
+    t = int(time.time()) + TKM_OFFSET
+    return time.strftime("%Y%m%d", time.gmtime(t))
+
+def daily_stats(uid):
+    con=db()
+    cur=con.cursor()
+    key=today_key()
+    start=int(time.mktime(time.strptime(key,"%Y%m%d")))
+    cur.execute("""
+    SELECT status FROM signals
+    WHERE user_id=? AND ts>=?
+    """,(uid,start))
+    rows=cur.fetchall()
+    con.close()
+
+    wins=0
+    losses=0
+    streak=0
+
+    for r in rows:
+        if r[0]=="WIN":
+            streak=0
+            wins+=1
+        elif r[0]=="LOSE":
+            streak+=1
+            losses+=1
+
+    return wins,losses,streak
+
+# ================= EVALUATOR =================
+
 async def evaluator_loop():
     while True:
-        try:
-            con = db()
-            cur = con.cursor()
-            cur.execute("""
-                SELECT id, symbol, side, tp, sl, ts, eval_bars
-                FROM signals
-                WHERE status='PENDING'
-                ORDER BY ts ASC
-                LIMIT 80
-            """)
-            rows = cur.fetchall()
-            con.close()
+        con=db()
+        cur=con.cursor()
+        cur.execute("SELECT id,symbol,side,tp,sl,ts FROM signals WHERE status='PENDING'")
+        rows=cur.fetchall()
+        con.close()
 
-            now = int(time.time())
-
-            for (sid, sym, side, tp, sl, ts0, bars) in rows:
-                need_seconds = int(bars) * 5 * 60
-                if now - int(ts0) < need_seconds:
-                    continue
-
-                try:
-                    start_ms = int(ts0) * 1000
-                    k = await klines(sym, EVAL_INTERVAL, start_ms=start_ms, limit=int(bars) + 6)
-                    if len(k) < int(bars):
-                        continue
-
-                    window = k[:int(bars)]
-                    highs = [float(x[2]) for x in window]
-                    lows = [float(x[3]) for x in window]
-                    last_price = float(window[-1][4])
-
-                    hit_tp = False
-                    hit_sl = False
-
-                    if side == "LONG":
-                        hit_tp = max(highs) >= float(tp)
-                        hit_sl = min(lows) <= float(sl)
-                    else:
-                        hit_tp = min(lows) <= float(tp)
-                        hit_sl = max(highs) >= float(sl)
-
-                    # binary result:
-                    # - if both hit within window -> LOSE (консервативно)
-                    # - if only TP -> WIN
-                    # - else -> LOSE
-                    if hit_tp and not hit_sl:
-                        status = "WIN"
-                    else:
-                        status = "LOSE"
-
-                    con2 = db()
-                    cur2 = con2.cursor()
-                    cur2.execute("""
-                        UPDATE signals
-                        SET status=?, resolved_ts=?, resolved_price=?
-                        WHERE id=?
-                    """, (status, int(time.time()), float(last_price), sid))
-                    con2.commit()
-                    con2.close()
-
-                except Exception:
-                    continue
-
-        except Exception:
-            pass
-
-        await asyncio.sleep(EVAL_LOOP_SECONDS)
-
-
-# =========================
-# ACCESS / ADMIN
-# =========================
-def is_admin(user_id: int) -> bool:
-    return ADMIN_ID != 0 and user_id == ADMIN_ID
-
-def fmt_until(ts: int) -> str:
-    if ts <= 0:
-        return "нет"
-    return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ts))
-
-
-# =========================
-# KEYBOARDS
-# =========================
-def kb_user(user_id: int):
-    u = get_user(user_id)
-    active, until = is_access_active(user_id)
-
-    kb = InlineKeyboardBuilder()
-
-    if active:
-        kb.button(text="📣 Сигнал", callback_data="sig_now")
-        kb.button(text="📊 Статистика", callback_data="stats")
-        kb.button(text="🪙 По монетам", callback_data="stats_coins")
-        kb.button(text=f"🤖 Автосканер: {'ON' if u['autoscan'] else 'OFF'}", callback_data="toggle_auto")
-    else:
-        kb.button(text="📝 Запросить доступ", callback_data="request_access")
-        kb.button(text="ℹ️ Как работает", callback_data="how")
-    kb.adjust(1)
-    return kb.as_markup()
-
-def kb_admin_request(req_user_id: int):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ +7 дней", callback_data=f"approve:{req_user_id}:7")
-    kb.button(text="✅ +15 дней", callback_data=f"approve:{req_user_id}:15")
-    kb.button(text="✅ +30 дней", callback_data=f"approve:{req_user_id}:30")
-    kb.button(text="❌ Отклонить", callback_data=f"reject:{req_user_id}")
-    kb.adjust(1)
-    return kb.as_markup()
-
-
-# =========================
-# BOT
-# =========================
-bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
-dp = Dispatcher()
-
-
-@dp.message(F.text.in_({"/start", "start"}))
-async def start(m: Message):
-    db_init()
-    ensure_user(m.from_user.id)
-
-    active, until = is_access_active(m.from_user.id)
-    if active:
-        await m.answer(
-            "✅ Доступ активен\n"
-            f"До: <b>{fmt_until(until)}</b>\n\n"
-            "Жми кнопки ниже.",
-            reply_markup=kb_user(m.from_user.id)
-        )
-    else:
-        await m.answer(
-            "⛔️ Доступ по одобрению.\n\n"
-            "Нажми «Запросить доступ». Админу придёт заявка с кнопками +7/+15/+30.\n",
-            reply_markup=kb_user(m.from_user.id)
-        )
-
-@dp.message(F.text.in_({"/myid", "myid"}))
-async def myid(m: Message):
-    await m.answer(f"Твой ID: <code>{m.from_user.id}</code>")
-
-@dp.callback_query(F.data == "how")
-async def how(cb: CallbackQuery):
-    await cb.answer()
-    await cb.message.answer(
-        "ℹ️ <b>Как работает</b>\n"
-        f"• Берём Top-{TOP_N} USDT по 24h объёму (фильтр ≥ {MIN_QUOTE_VOL_USDT_24H:,.0f} USDT)\n"
-        f"• Нажми «📣 Сигнал» — бот найдёт лучший сетап сейчас\n"
-        f"• Результат считается автоматически через {EVAL_BARS} свечи 5m\n"
-        "• Винрейт = WIN/LOSE (без нейтрали)\n",
-        reply_markup=kb_user(cb.from_user.id)
-    )
-
-@dp.callback_query(F.data == "request_access")
-async def request_access(cb: CallbackQuery):
-    uid = cb.from_user.id
-    ensure_user(uid)
-    ok = create_request(uid)
-    await cb.answer("Ок")
-
-    if ok:
-        await cb.message.answer("✅ Заявка отправлена. Жди одобрения.", reply_markup=kb_user(uid))
-        if ADMIN_ID:
+        for sid,sym,side,tp,sl,ts0 in rows:
+            if time.time()-ts0 < EVAL_BARS*300:
+                continue
             try:
-                await bot.send_message(
-                    ADMIN_ID,
-                    f"🛂 Заявка на доступ от <code>{uid}</code>",
-                    reply_markup=kb_admin_request(uid)
-                )
-            except Exception:
-                pass
+                k = await klines(sym,"5m",limit=EVAL_BARS+5)
+                highs=[float(x[2]) for x in k[:EVAL_BARS]]
+                lows=[float(x[3]) for x in k[:EVAL_BARS]]
+
+                if side=="LONG":
+                    if max(highs)>=tp:
+                        status="WIN"
+                    else:
+                        status="LOSE"
+                else:
+                    if min(lows)<=tp:
+                        status="WIN"
+                    else:
+                        status="LOSE"
+
+                con2=db()
+                cur2=con2.cursor()
+                cur2.execute("UPDATE signals SET status=? WHERE id=?",(status,sid))
+                con2.commit()
+                con2.close()
+            except:
+                continue
+
+        await asyncio.sleep(30)
+        # ================= SAVE SIGNAL =================
+
+def save_signal(uid, s: Signal):
+    con=db()
+    cur=con.cursor()
+    cur.execute("""
+    INSERT INTO signals(ts,user_id,symbol,side,entry,tp,sl,status)
+    VALUES(?,?,?,?,?,?,?,'PENDING')
+    """,(int(time.time()),uid,s.symbol,s.side,s.entry,s.tp,s.sl))
+    con.commit()
+    con.close()
+
+# ================= STATS =================
+
+def total_stats(uid):
+    con=db()
+    cur=con.cursor()
+    cur.execute("""
+    SELECT
+    SUM(CASE WHEN status='WIN' THEN 1 ELSE 0 END),
+    SUM(CASE WHEN status='LOSE' THEN 1 ELSE 0 END),
+    COUNT(*)
+    FROM signals WHERE user_id=? AND status!='PENDING'
+    """,(uid,))
+    w,l,t=cur.fetchone()
+    con.close()
+    w=w or 0
+    l=l or 0
+    t=t or 0
+    wr=(w/t*100) if t else 0
+    return w,l,t,wr
+
+def last_signals(uid):
+    con=db()
+    cur=con.cursor()
+    cur.execute("""
+    SELECT symbol,side,status
+    FROM signals WHERE user_id=?
+    ORDER BY id DESC LIMIT 10
+    """,(uid,))
+    rows=cur.fetchall()
+    con.close()
+    return rows
+
+# ================= KEYBOARD =================
+
+def main_kb(uid):
+    kb=InlineKeyboardBuilder()
+    if active(uid):
+        kb.button(text="📣 Сигнал",callback_data="signal")
+        kb.button(text="📊 Статистика",callback_data="stats")
+        kb.button(text="📜 Последние 10",callback_data="history")
+        kb.button(text="🔄 Режим",callback_data="mode")
+        kb.button(text="🤖 Авто ON/OFF",callback_data="auto")
     else:
-        await cb.message.answer("⏳ У тебя уже есть активная заявка. Жди.", reply_markup=kb_user(uid))
+        kb.button(text="📝 Запросить доступ",callback_data="request")
+    kb.adjust(1)
+    return kb.as_markup()
 
-@dp.callback_query(F.data.startswith("approve:"))
-async def approve(cb: CallbackQuery):
-    if not is_admin(cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
-        return
-    parts = cb.data.split(":")
-    if len(parts) != 3:
-        await cb.answer("Ошибка", show_alert=True)
-        return
-    uid = int(parts[1])
-    days = int(parts[2])
+# ================= BOT =================
 
-    ensure_user(uid)
-    until = approve_user(uid, days)
+@dp.message(F.text=="/start")
+async def start(m:Message):
+    init_db()
+    ensure_user(m.from_user.id)
+    if active(m.from_user.id):
+        await m.answer("✅ Доступ активен",reply_markup=main_kb(m.from_user.id))
+    else:
+        await m.answer("⛔️ Нет доступа",reply_markup=main_kb(m.from_user.id))
 
-    await cb.answer("Одобрено ✅")
-    await cb.message.answer(f"✅ Одобрено для <code>{uid}</code> на {days} дней (до {fmt_until(until)}).")
+@dp.callback_query(F.data=="request")
+async def request(cb:CallbackQuery):
+    await cb.answer("Заявка отправлена админу")
+    if ADMIN_ID:
+        await bot.send_message(ADMIN_ID,f"Запрос от {cb.from_user.id}")
 
-    try:
-        await bot.send_message(uid, f"✅ Доступ выдан на {days} дней.\nДо: <b>{fmt_until(until)}</b>\nНажми /start")
-    except Exception:
-        pass
+@dp.callback_query(F.data=="mode")
+async def mode_toggle(cb:CallbackQuery):
+    con=db()
+    cur=con.cursor()
+    cur.execute("SELECT mode FROM users WHERE user_id=?",(cb.from_user.id,))
+    mode=cur.fetchone()[0]
+    new="BALANCED" if mode=="STRICT" else "STRICT"
+    cur.execute("UPDATE users SET mode=? WHERE user_id=?",(new,cb.from_user.id))
+    con.commit()
+    con.close()
+    await cb.answer(f"Режим: {new}")
+    await cb.message.edit_reply_markup(reply_markup=main_kb(cb.from_user.id))
 
-@dp.callback_query(F.data.startswith("reject:"))
-async def reject(cb: CallbackQuery):
-    if not is_admin(cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
-        return
-    parts = cb.data.split(":")
-    if len(parts) != 2:
-        await cb.answer("Ошибка", show_alert=True)
-        return
-    uid = int(parts[1])
-    reject_user_request(uid)
-    await cb.answer("Отклонено")
-    await cb.message.answer(f"❌ Отклонено для <code>{uid}</code>.")
-    try:
-        await bot.send_message(uid, "❌ Доступ не одобрен.")
-    except Exception:
-        pass
-
-@dp.callback_query(F.data == "toggle_auto")
-async def toggle_auto(cb: CallbackQuery):
-    uid = cb.from_user.id
-    active, _ = is_access_active(uid)
-    if not active:
-        await cb.answer("Нет доступа", show_alert=True)
-        return
-    u = get_user(uid)
-    new_val = not bool(u["autoscan"])
-    set_autoscan(uid, new_val)
-    await cb.answer("Ок")
-    await cb.message.answer(f"🤖 Автосканер теперь: <b>{'ON' if new_val else 'OFF'}</b>", reply_markup=kb_user(uid))
-
-@dp.callback_query(F.data == "sig_now")
-async def sig_now(cb: CallbackQuery):
-    uid = cb.from_user.id
-    active, until = is_access_active(uid)
-    if not active:
-        await cb.answer("Нет доступа", show_alert=True)
+@dp.callback_query(F.data=="signal")
+async def signal(cb:CallbackQuery):
+    uid=cb.from_user.id
+    if not active(uid):
+        await cb.answer("Нет доступа",show_alert=True)
         return
 
-    await cb.answer("Сканирую Top-100…")
+    wins,losses,streak=daily_stats(uid)
+    if streak>=MAX_LOSS_STREAK:
+        await cb.answer("3 лося подряд. Пауза до конца дня.",show_alert=True)
+        return
 
-    syms = await top_symbols()
-    best: Optional[Signal] = None
-    errors = 0
+    if wins+losses>=DAILY_LIMIT:
+        await cb.answer("Дневной лимит достигнут",show_alert=True)
+        return
 
+    con=db()
+    cur=con.cursor()
+    cur.execute("SELECT mode FROM users WHERE user_id=?",(uid,))
+    mode=cur.fetchone()[0]
+    con.close()
+
+    syms=await top_symbols()
     for s in syms:
-        try:
-            sig = await build_signal(s)
-            if not sig:
-                continue
-            if (best is None) or (sig.score > best.score):
-                best = sig
-        except Exception:
-            errors += 1
-            continue
+        sig=await build_advanced_signal(s,mode)
+        if sig:
+            save_signal(uid,sig)
+            await cb.message.answer(
+                f"{sig.symbol}\n{sig.side}\nEntry:{sig.entry}\nTP:{sig.tp}\nSL:{sig.sl}",
+                reply_markup=main_kb(uid)
+            )
+            return
 
-    if not best:
-        await cb.message.answer(
-            f"Сейчас нет сигнала.\nОшибки API: {errors}\nПопробуй позже.",
-            reply_markup=kb_user(uid)
-        )
-        return
+    await cb.answer("Нет сигнала сейчас")
 
-    db_add_signal(uid, best.symbol, best.side, best.entry, best.tp, best.sl, best.score, EVAL_BARS)
-
+@dp.callback_query(F.data=="stats")
+async def stats(cb:CallbackQuery):
+    w,l,t,wr=total_stats(cb.from_user.id)
     await cb.message.answer(
-        f"📣 <b>{best.symbol}</b>\n"
-        f"Направление: <b>{best.side}</b>\n"
-        f"Вход: <b>MARKET NOW</b> ≈ <code>{best.entry:.6f}</code>\n"
-        f"TP: <code>{best.tp:.6f}</code>\n"
-        f"SL: <code>{best.sl:.6f}</code>\n"
-        f"Оценка результата: через <b>{EVAL_BARS}</b> свечи 5m\n"
-        f"Score: <b>{best.score}</b>\n\n"
-        "📊 Итог попадёт в статистику автоматически.",
-        reply_markup=kb_user(uid)
+        f"WIN:{w}\nLOSE:{l}\nВсего:{t}\nWinrate:{wr:.1f}%",
+        reply_markup=main_kb(cb.from_user.id)
     )
 
-@dp.callback_query(F.data == "stats")
-async def stats(cb: CallbackQuery):
-    uid = cb.from_user.id
-    active, until = is_access_active(uid)
-    if not active:
-        await cb.answer("Нет доступа", show_alert=True)
-        return
+@dp.callback_query(F.data=="history")
+async def history(cb:CallbackQuery):
+    rows=last_signals(cb.from_user.id)
+    text="Последние сигналы:\n"
+    for s in rows:
+        text+=f"{s[0]} {s[1]} {s[2]}\n"
+    await cb.message.answer(text,reply_markup=main_kb(cb.from_user.id))
 
-    w, l, done, wr, pending = stats_total(uid)
-    await cb.answer()
-    await cb.message.answer(
-        "📊 <b>Статистика</b>\n"
-        f"Доступ до: <b>{fmt_until(until)}</b>\n\n"
-        f"WIN: <b>{w}</b>\n"
-        f"LOSE: <b>{l}</b>\n"
-        f"DONE: <b>{done}</b>\n"
-        f"PENDING: <b>{pending}</b>\n"
-        f"Winrate (WIN/LOSE): <b>{wr:.1f}%</b>\n\n"
-        "⚠️ Смотри на дистанции 30–50+ сигналов.",
-        reply_markup=kb_user(uid)
-    )
+# ================= AUTOSCAN =================
 
-@dp.callback_query(F.data == "stats_coins")
-async def stats_coins(cb: CallbackQuery):
-    uid = cb.from_user.id
-    active, _ = is_access_active(uid)
-    if not active:
-        await cb.answer("Нет доступа", show_alert=True)
-        return
-
-    rows = stats_by_coin(uid, min_trades=5, limit=10)
-    await cb.answer()
-
-    if not rows:
-        await cb.message.answer(
-            "🪙 Пока мало данных по монетам.\nНужно минимум 5 завершённых сделок на монету.",
-            reply_markup=kb_user(uid)
-        )
-        return
-
-    text = "🪙 <b>Топ монет по winrate</b> (мин. 5 сделок)\n\n"
-    for sym, t, wr in rows:
-        text += f"• <b>{sym}</b> — {t} сделок — <b>{wr:.1f}%</b>\n"
-
-    await cb.message.answer(text, reply_markup=kb_user(uid))
-
-
-# =========================
-# AUTOSCAN LOOP
-# =========================
-async def autoscan_loop():
+async def autoscan():
     while True:
-        try:
-            con = db()
-            cur = con.cursor()
-            cur.execute("SELECT user_id FROM users WHERE status='APPROVED' AND autoscan=1")
-            users = [r[0] for r in cur.fetchall()]
-            con.close()
+        con=db()
+        cur=con.cursor()
+        cur.execute("SELECT user_id,mode FROM users WHERE status='APPROVED' AND autoscan=1")
+        users=cur.fetchall()
+        con.close()
 
-            if not users:
-                await asyncio.sleep(AUTO_SCAN_EVERY_MIN * 60)
+        syms=await top_symbols()
+
+        for uid,mode in users:
+            wins,losses,streak=daily_stats(uid)
+            if streak>=MAX_LOSS_STREAK:
                 continue
-
-            syms = await top_symbols()
-            best: Optional[Signal] = None
+            if wins+losses>=DAILY_LIMIT:
+                continue
 
             for s in syms:
-                try:
-                    sig = await build_signal(s)
-                    if not sig:
-                        continue
-                    if (best is None) or (sig.score > best.score):
-                        best = sig
-                except Exception:
-                    continue
+                sig=await build_advanced_signal(s,mode)
+                if sig:
+                    save_signal(uid,sig)
+                    await bot.send_message(
+                        uid,
+                        f"🤖 Автосигнал\n{sig.symbol}\n{sig.side}\nEntry:{sig.entry}\nTP:{sig.tp}\nSL:{sig.sl}"
+                    )
+                    break
 
-            if best:
-                for uid in users:
-                    active, _ = is_access_active(uid)
-                    if not active:
-                        continue
-                    try:
-                        db_add_signal(uid, best.symbol, best.side, best.entry, best.tp, best.sl, best.score, EVAL_BARS)
-                        await bot.send_message(
-                            uid,
-                            f"🤖 <b>Автосканер</b>\n\n"
-                            f"📣 <b>{best.symbol}</b>\n"
-                            f"Направление: <b>{best.side}</b>\n"
-                            f"Вход: <b>MARKET NOW</b> ≈ <code>{best.entry:.6f}</code>\n"
-                            f"TP: <code>{best.tp:.6f}</code>\n"
-                            f"SL: <code>{best.sl:.6f}</code>\n"
-                            f"Оценка: через <b>{EVAL_BARS}</b> свечи 5m\n"
-                            f"Score: <b>{best.score}</b>\n",
-                            reply_markup=kb_user(uid)
-                        )
-                    except Exception:
-                        continue
+        await asyncio.sleep(AUTO_INTERVAL*60)
 
-        except Exception:
-            pass
+# ================= MAIN =================
 
-        await asyncio.sleep(AUTO_SCAN_EVERY_MIN * 60)
-
-
-# =========================
-# MAIN
-# =========================
 async def main():
-    db_init()
+    init_db()
     asyncio.create_task(evaluator_loop())
-    asyncio.create_task(autoscan_loop())
+    asyncio.create_task(autoscan())
     await dp.start_polling(bot)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     asyncio.run(main())
