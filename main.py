@@ -3,7 +3,7 @@ import time
 import asyncio
 import random
 from dataclasses import dataclass
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 
 import httpx
 from dotenv import load_dotenv
@@ -13,7 +13,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.filters import CommandStart, Command
 
 # =========================
-# CONFIG
+# НАСТРОЙКИ
 # =========================
 load_dotenv()
 
@@ -27,29 +27,31 @@ if ADMIN_ID == 0:
 
 BINGX_BASE = "https://open-api.bingx.com"
 
-# Universe / limits
-TOP_N_STRICT = 50
-TOP_N_MANUAL_MAX = 150
+# Монеты и фильтры
+TOP_N_STRICT = 60
+TOP_N_MANUAL_MAX = 180
 MIN_QUOTE_VOL_STRICT = 50_000_000.0
 MIN_QUOTE_VOL_MANUAL = 10_000_000.0
 MIN_PRICE = 0.01
 
-# Manual output
+# Выдача
 SHOW_TOP_K = 3
-ENTRY_MIN_PROB = 7  # вход только если prob >= 7 и strict_ok=True
+ENTRY_MIN_PROB = 7  # ВХОД только если Prob >= 7 и Strict=OK
 
-# Autoscan
+# Автоанализ
 AUTO_SCAN_EVERY_MIN = 60
 AUTO_MIN_PROB = 7
-BROADCAST_COOLDOWN_SEC = 30 * 60  # чтобы не спамить
+BROADCAST_COOLDOWN_SEC = 30 * 60
 
-# HTTP/stability
+# HTTP
 HTTP_TIMEOUT = 25
 HTTP_CONCURRENCY = 4
 SCAN_TIMEOUT_SECONDS = 35
 TOPLIST_CACHE_TTL = 10 * 60
+PRICE_CACHE_TTL = 6
 
-# Strategy strict gates
+# STRATEGY (ATR-стоп и RR)
+ATR_PERIOD = 14
 ATR_MIN_PCT = 0.30
 VOL_RATIO_MIN = 1.10
 OVERHEAT_DIST_MAX_PCT = 1.20
@@ -58,12 +60,17 @@ RSI_LONG_MAX = 70
 RSI_SHORT_MIN = 30
 RSI_SHORT_MAX = 45
 
-# Simple risk box
-TP_PCT = 1.0
-SL_PCT = 0.5
+ATR_SL_MULT = 1.20   # SL = ATR * 1.20
+RR_TP = 1.80         # TP distance = SL distance * 1.80
+
+MAX_SL_PCT = 3.50    # ограничим стоп, чтобы не был огромным
+MIN_SL_PCT = 0.25    # и не был слишком микроскопическим
+
+# Допуск к рыночному входу (если цена уже убежала сильно - сигнал лучше не брать)
+MAX_SLIPPAGE_PCT = 0.80
 
 # =========================
-# BOT
+# БОТ
 # =========================
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
@@ -72,13 +79,14 @@ HTTP_SEM = asyncio.Semaphore(HTTP_CONCURRENCY)
 HTTP_CLIENT: Optional[httpx.AsyncClient] = None
 
 TOP_CACHE: Dict[str, object] = {"ts": 0.0, "strict": [], "manual": []}
+PRICE_CACHE: Dict[str, Tuple[float, float]] = {}  # symbol -> (ts, last_price)
 LAST_BROADCAST_TS = 0
 
 # =========================
-# TEXT (русский, без эмодзи)
+# ТЕКСТ (русский, без эмодзи)
 # =========================
 JOKES_OK = [
-    "Сетап выглядит бодро. Стоп обязателен.",
+    "Сетап выглядит бодро. Дисциплина и риск-менеджмент обязательны.",
     "План есть. Теперь не мешай ему сработать.",
     "Входи по правилам, а не по эмоциям.",
     "Дисциплина важнее одного сигнала.",
@@ -158,7 +166,7 @@ async def fetch_bingx(path: str, params: Optional[dict] = None) -> dict:
     raise last_err
 
 # =========================
-# INDICATORS
+# ИНДИКАТОРЫ
 # =========================
 def ema(values: List[float], period: int) -> List[float]:
     if not values:
@@ -205,8 +213,11 @@ def atr(high: List[float], low: List[float], close: List[float], period: int = 1
 def clamp_int(x: float, lo: int, hi: int) -> int:
     return max(lo, min(hi, int(round(x))))
 
+def clamp_float(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
 # =========================
-# MARKET DATA
+# РЫНОЧНЫЕ ДАННЫЕ
 # =========================
 def _get_float(d: dict, keys: List[str], default: float = 0.0) -> float:
     for k in keys:
@@ -269,7 +280,7 @@ async def top_symbols(min_quote_vol: float, top_n: int, cache_key: str) -> List[
     TOP_CACHE[cache_key] = syms
     return syms
 
-def _parse_klines(kl: List[dict]) -> tuple[List[float], List[float], List[float], List[float], List[float]]:
+def _parse_klines(kl: List[dict]) -> Tuple[List[float], List[float], List[float], List[float], List[float]]:
     o, h, l, c, v = [], [], [], [], []
     for x in kl:
         oo = _get_float(x, ["o", "open"], 0.0)
@@ -286,19 +297,63 @@ def _parse_klines(kl: List[dict]) -> tuple[List[float], List[float], List[float]
         v.append(vv)
     return o, h, l, c, v
 
+async def get_last_price(symbol: str) -> float:
+    now = time.time()
+    cached = PRICE_CACHE.get(symbol)
+    if cached and (now - cached[0] <= PRICE_CACHE_TTL):
+        return cached[1]
+
+    tickers = await swap_tickers_24h()
+    price = 0.0
+    for t in tickers:
+        sym = t.get("symbol") or t.get("s") or ""
+        if sym != symbol:
+            continue
+        price = _get_float(t, ["lastPrice", "last", "close", "c"], 0.0)
+        break
+
+    if price <= 0:
+        # fallback: попробуем дернуть одиночный тикер (если доступно) через те же данные
+        price = 0.0
+
+    PRICE_CACHE[symbol] = (now, price)
+    return price
+
 # =========================
-# STRATEGY / SCORING
+# СТРАТЕГИЯ (с ATR стопом)
 # =========================
 @dataclass
 class Candidate:
     symbol: str
     side: str
-    entry: float
-    tp: float
-    sl: float
     prob: int
     strict_ok: bool
     reason: str
+    ref_price: float        # цена на момент расчета (последняя 5m)
+    atr_abs_15m: float      # ATR в цене
+    atr_pct_15m: float
+
+def compute_levels_market(side: str, entry_market: float, atr_abs: float) -> Tuple[float, float, float]:
+    # SL distance = ATR * mult (с ограничениями по %)
+    dist = atr_abs * ATR_SL_MULT
+    if entry_market > 0:
+        dist_pct = dist / entry_market * 100.0
+    else:
+        dist_pct = 0.0
+
+    dist_pct = clamp_float(dist_pct, MIN_SL_PCT, MAX_SL_PCT)
+    dist = entry_market * (dist_pct / 100.0)
+
+    tp_dist = dist * RR_TP
+
+    if side == "LONG":
+        sl = entry_market - dist
+        tp = entry_market + tp_dist
+    else:
+        sl = entry_market + dist
+        tp = entry_market - tp_dist
+
+    return entry_market, tp, sl
 
 async def analyze_symbol(symbol: str) -> Optional[Candidate]:
     t1 = asyncio.create_task(swap_klines(symbol, "1h", 210))
@@ -321,17 +376,17 @@ async def analyze_symbol(symbol: str) -> Optional[Candidate]:
     trend_up = (e50_1 > e200_1) and (e50_15 > e200_15)
     trend_down = (e50_1 < e200_1) and (e50_15 < e200_15)
 
-    a15 = atr(h15, l15, c15, 14)[-1]
+    a15 = atr(h15, l15, c15, ATR_PERIOD)[-1]
     atr_pct = (a15 / c15[-1]) * 100.0 if c15[-1] else 0.0
 
     last_vol = v15[-1]
     avg_vol = sum(v15[-50:]) / 50.0
     vol_ratio = (last_vol / avg_vol) if avg_vol > 0 else 0.0
 
-    last5 = c5[-1]
+    ref_price = c5[-1]
     prev5 = c5[-2]
-    bullish5 = last5 > prev5
-    bearish5 = last5 < prev5
+    bullish5 = ref_price > prev5
+    bearish5 = ref_price < prev5
     r5 = rsi(c5, 14)[-1]
 
     e50_15_last = ema(c15, 50)[-1]
@@ -345,16 +400,17 @@ async def analyze_symbol(symbol: str) -> Optional[Candidate]:
     else:
         return None
 
+    # Скоринг (0..10)
     score = 0
     reasons = ["trend(1h+15m)"]
 
-    if atr_pct >= 0.45:
+    if atr_pct >= 0.60:
         score += 2
     elif atr_pct >= ATR_MIN_PCT:
         score += 1
     reasons.append(f"atr%={atr_pct:.2f}")
 
-    if vol_ratio >= 1.50:
+    if vol_ratio >= 1.60:
         score += 2
     elif vol_ratio >= VOL_RATIO_MIN:
         score += 1
@@ -372,7 +428,7 @@ async def analyze_symbol(symbol: str) -> Optional[Candidate]:
         rsi_ok = True
     reasons.append(f"rsi={r5:.1f}")
 
-    if dist_pct <= 0.8:
+    if dist_pct <= 0.9:
         score += 1
     elif dist_pct > OVERHEAT_DIST_MAX_PCT:
         score -= 1
@@ -388,15 +444,16 @@ async def analyze_symbol(symbol: str) -> Optional[Candidate]:
         and rsi_ok
     )
 
-    entry = last5
-    if side == "LONG":
-        tp = entry * (1 + TP_PCT / 100.0)
-        sl = entry * (1 - SL_PCT / 100.0)
-    else:
-        tp = entry * (1 - TP_PCT / 100.0)
-        sl = entry * (1 + SL_PCT / 100.0)
-
-    return Candidate(symbol, side, entry, tp, sl, prob, strict_ok, "; ".join(reasons))
+    return Candidate(
+        symbol=symbol,
+        side=side,
+        prob=prob,
+        strict_ok=strict_ok,
+        reason="; ".join(reasons),
+        ref_price=ref_price,
+        atr_abs_15m=a15,
+        atr_pct_15m=atr_pct
+    )
 
 async def top_k_candidates(symbols: List[str], k: int) -> List[Candidate]:
     tasks = [asyncio.create_task(analyze_symbol(s)) for s in symbols]
@@ -428,6 +485,11 @@ def pick_best_strict(cands: List[Candidate]) -> Optional[Candidate]:
     strict.sort(key=lambda x: x.prob, reverse=True)
     return strict[0]
 
+def slippage_pct(current: float, ref: float) -> float:
+    if current <= 0 or ref <= 0:
+        return 999.0
+    return abs(current - ref) / ref * 100.0
+
 # =========================
 # UI
 # =========================
@@ -437,15 +499,28 @@ def kb_admin_menu():
     kb.adjust(1)
     return kb.as_markup()
 
-def format_candidate(c: Candidate, idx: int) -> str:
+def format_candidate_market(c: Candidate, idx: int, entry_market: float) -> str:
+    entry, tp, sl = compute_levels_market(c.side, entry_market, c.atr_abs_15m)
     ok_enter = (c.prob >= ENTRY_MIN_PROB) and c.strict_ok
+
     badge = "ВХОД" if ok_enter else "ЖДАТЬ"
     note = "" if c.strict_ok else " (наблюдение)"
+
+    # Подсказка для BingX
+    hint = "Для BingX: TP/SL = рыночные, триггер = Mark Price."
+
+    # Для SHORT SL должен быть выше входа, для LONG ниже
+    if c.side == "SHORT":
+        rule = "SHORT: стоп выше входа, тейк ниже входа."
+    else:
+        rule = "LONG: стоп ниже входа, тейк выше входа."
+
     return (
         f"<b>#{idx} {c.symbol}</b> - <b>{badge}</b>{note}\n"
         f"Сторона: <b>{c.side}</b> | Вероятность: <b>{c.prob}/10</b> | Strict: <b>{'OK' if c.strict_ok else 'NO'}</b>\n"
-        f"Вход: <b>MARKET</b> ~= <code>{c.entry:.6f}</code>\n"
-        f"TP: <code>{c.tp:.6f}</code> | SL: <code>{c.sl:.6f}</code>\n"
+        f"Вход: <b>MARKET сейчас</b> ~= <code>{entry:.6f}</code>\n"
+        f"TP: <code>{tp:.6f}</code> | SL: <code>{sl:.6f}</code>\n"
+        f"<i>{rule} {hint}</i>\n"
         f"<i>{c.reason}</i>"
     )
 
@@ -458,7 +533,8 @@ async def start_cmd(m: Message):
         await m.answer("Этот бот приватный. Доступ запрещен.")
         return
     await m.answer(
-        "Бот активен. Нажми кнопку 'Сигнал' для принудительного анализа.\n"
+        "Бот активен.\n"
+        "Кнопка 'Сигнал' делает принудительный анализ и дает рыночный вход.\n"
         f"Автоанализ: каждые {AUTO_SCAN_EVERY_MIN} минут (если есть сильный сигнал, он придет сюда).",
         reply_markup=kb_admin_menu(),
     )
@@ -487,17 +563,31 @@ async def sig_now(cb: CallbackQuery):
             await msg.edit_text("Сейчас нет достойных кандидатов.\n\n" + joke(JOKES_NO))
             return
 
-        best_strict = pick_best_strict(cands)
+        # Для каждого кандидата берем текущую цену и строим MARKET TP/SL от нее
+        blocks = []
+        for i, c in enumerate(cands, 1):
+            cur = await get_last_price(c.symbol)
+            if cur <= 0:
+                continue
+            slip = slippage_pct(cur, c.ref_price)
+            # Если цена уже убежала слишком далеко от цены, на которой был сетап - помечаем
+            warn = ""
+            if slip > MAX_SLIPPAGE_PCT:
+                warn = f"\n<i>Предупреждение: цена ушла на {slip:.2f}%. Лучше пересканировать позже.</i>"
+            blocks.append(format_candidate_market(c, i, cur) + warn)
 
+        if not blocks:
+            await msg.edit_text("Не удалось получить текущие цены. Попробуй еще раз.\n\n" + joke(JOKES_ERR))
+            return
+
+        best_strict = pick_best_strict(cands)
         header = (
             f"<b>Топ-{SHOW_TOP_K} кандидата</b>\n"
             f"Вход только если <b>Prob >= {ENTRY_MIN_PROB}</b> и <b>Strict=OK</b>\n"
-            f"Strict=NO - наблюдение, не вход.\n\n"
+            f"Вход: рыночный (по текущей цене).\n\n"
         )
 
-        blocks = [format_candidate(c, i) for i, c in enumerate(cands, 1)]
         tail = joke(JOKES_OK) if (best_strict and best_strict.prob >= ENTRY_MIN_PROB) else joke(JOKES_WAIT)
-
         await msg.edit_text(header + "\n\n".join(blocks) + "\n\n" + tail)
 
     except Exception as e:
@@ -511,8 +601,8 @@ async def autoscan_loop():
     global LAST_BROADCAST_TS
     while True:
         try:
-            strict_syms = await top_symbols(MIN_QUOTE_VOL_STRICT, TOP_N_STRICT, "strict")
-            cands = await top_k_candidates(strict_syms, SHOW_TOP_K)
+            syms = await top_symbols(MIN_QUOTE_VOL_STRICT, TOP_N_STRICT, "strict")
+            cands = await top_k_candidates(syms, SHOW_TOP_K)
 
             best = None
             if cands:
@@ -523,22 +613,34 @@ async def autoscan_loop():
             if best:
                 now = int(time.time())
                 if now - int(LAST_BROADCAST_TS) >= BROADCAST_COOLDOWN_SEC:
-                    LAST_BROADCAST_TS = now
-                    text = (
-                        f"<b>Автоанализ (каждые {AUTO_SCAN_EVERY_MIN} минут)</b>\n\n"
-                        f"<b>{best.symbol}</b>\n"
-                        f"Сторона: <b>{best.side}</b>\n"
-                        f"Вход: <b>MARKET</b> ~= <code>{best.entry:.6f}</code>\n"
-                        f"TP: <code>{best.tp:.6f}</code>\n"
-                        f"SL: <code>{best.sl:.6f}</code>\n"
-                        f"Вероятность: <b>{best.prob}/10</b>\n"
-                        f"<i>{best.reason}</i>\n\n"
-                        f"{joke(JOKES_OK)}"
-                    )
-                    try:
-                        await bot.send_message(ADMIN_ID, text, reply_markup=kb_admin_menu())
-                    except Exception:
-                        pass
+                    cur = await get_last_price(best.symbol)
+                    if cur > 0:
+                        slip = slippage_pct(cur, best.ref_price)
+                        entry, tp, sl = compute_levels_market(best.side, cur, best.atr_abs_15m)
+
+                        extra = ""
+                        if slip > MAX_SLIPPAGE_PCT:
+                            extra = f"\n<i>Предупреждение: цена ушла на {slip:.2f}%. Можно дождаться нового сетапа.</i>"
+
+                        text = (
+                            f"<b>Автоанализ (каждые {AUTO_SCAN_EVERY_MIN} минут)</b>\n\n"
+                            f"<b>{best.symbol}</b>\n"
+                            f"Сторона: <b>{best.side}</b>\n"
+                            f"Вход: <b>MARKET сейчас</b> ~= <code>{entry:.6f}</code>\n"
+                            f"TP: <code>{tp:.6f}</code>\n"
+                            f"SL: <code>{sl:.6f}</code>\n"
+                            f"Вероятность: <b>{best.prob}/10</b>\n"
+                            f"<i>{best.reason}</i>\n"
+                            f"<i>Для BingX: TP/SL = рыночные, триггер = Mark Price.</i>"
+                            f"{extra}\n\n"
+                            f"{joke(JOKES_OK)}"
+                        )
+
+                        LAST_BROADCAST_TS = now
+                        try:
+                            await bot.send_message(ADMIN_ID, text, reply_markup=kb_admin_menu())
+                        except Exception:
+                            pass
 
         except Exception as e:
             print("AUTOSCAN ERROR:", repr(e))
