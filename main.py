@@ -29,10 +29,10 @@ DB_PATH = "signals.db"
 BINGX_BASE = "https://open-api.bingx.com"
 
 # Universe
-TOP_N_STRICT = 50           # first pass
-TOP_N_FALLBACK = 150        # fallback pass (manual button only)
+TOP_N_STRICT = 50            # autoscan + manual first pass
+TOP_N_MANUAL_MAX = 150       # manual broader search
 MIN_QUOTE_VOL_STRICT = 50_000_000.0
-MIN_QUOTE_VOL_FALLBACK = 10_000_000.0
+MIN_QUOTE_VOL_MANUAL = 10_000_000.0
 MIN_PRICE = 0.01
 
 # Auto scan
@@ -42,12 +42,12 @@ BROADCAST_COOLDOWN_SEC = 30 * 60
 
 # Manual signal output
 SHOW_TOP_K = 3
-ENTRY_MIN_PROB = 7          # "можно входить" если >= 7/10 и Strict=OK
+ENTRY_MIN_PROB = 7  # enter only if prob >= 7 and Strict=OK
 
 # Speed / stability
 HTTP_TIMEOUT = 25
 HTTP_CONCURRENCY = 4
-SCAN_TIMEOUT_SECONDS = 30
+SCAN_TIMEOUT_SECONDS = 35
 TOPLIST_CACHE_TTL = 10 * 60
 
 # Strategy thresholds (STRICT)
@@ -59,11 +59,6 @@ RSI_LONG_MAX = 70
 RSI_SHORT_MIN = 30
 RSI_SHORT_MAX = 45
 
-# Fallback loosen (manual button only; entry rules DO NOT change)
-ATR_MIN_PCT_FALLBACK = ATR_MIN_PCT * 0.80
-VOL_RATIO_MIN_FALLBACK = VOL_RATIO_MIN * 0.90
-OVERHEAT_DIST_MAX_PCT_FALLBACK = 1.60
-
 # TP/SL (for "market now" idea)
 TP_PCT = 1.0
 SL_PCT = 0.5
@@ -74,7 +69,7 @@ dp = Dispatcher()
 HTTP_SEM = asyncio.Semaphore(HTTP_CONCURRENCY)
 HTTP_CLIENT: Optional[httpx.AsyncClient] = None
 
-TOP_CACHE: Dict[str, object] = {"ts": 0.0, "strict": [], "fallback": []}
+TOP_CACHE: Dict[str, object] = {"ts": 0.0, "strict": [], "manual": []}
 LAST_BROADCAST = {"ts": 0}
 
 # =========================
@@ -95,24 +90,22 @@ JOKES_WAIT = [
     "🎭 Рынок как актёр: делает вид, что даёт вход. Мы не ведёмся.",
 ]
 JOKES_NO = [
-    "🍵 Сигналов нет. Рынок выдал официальную справку: «Отдыхай».",
-    "🧱 Здесь входить — это как лбом стену тестить. Не надо.",
-    "🦉 Сегодня мудрый день: ничего не делать — тоже стратегия.",
+    "🍵 Рынок выдал справку: «Сегодня без сетапов».",
+    "🦉 Мудрый день: ничего не делать — тоже трейдинг.",
     "📉📈 График устроил спектакль без сюжета. Мы уходим из зала.",
-    "🧯 Ничего годного — значит сохраняем депозит, а не эмоции.",
+    "🧯 Сохраняем депозит. Нервы — тоже актив.",
+    "🧱 Здесь входить — это как лбом стену тестить. Не надо.",
 ]
 JOKES_ERR = [
     "📡 Биржа зависла. Свечи, видимо, грузятся по модему.",
     "🛠️ Данные не приехали. Рынок в ремонте на 30 секунд.",
     "🙃 Таймаут. BingX решил сыграть в «поймай меня, если сможешь».",
 ]
-
-JOKES_FALLBACK = [
-    "🧪 Включаю режим «детектив»: расширяю поиск и копаю глубже…",
-    "🔍 Первый проход пустой. Делаю второй — более широкий и умный.",
-    "🧹 Уберём лишний шум и посмотрим, где хоть что-то шевелится…",
+JOKES_MANUAL = [
+    "🔍 Делаю широкий поиск: даже если рынок скучный — покажу, что ближе всего.",
+    "🧪 Включаю режим «лаборатория»: посмотрим, где хоть что-то шевелится.",
+    "🧭 Окей, карта рынка: ищу 3 самых адекватных места.",
 ]
-
 def joke(arr: List[str]) -> str:
     return random.choice(arr)
 
@@ -356,7 +349,7 @@ def clamp_int(x: float, lo: int, hi: int) -> int:
     return max(lo, min(hi, int(round(x))))
 
 # =========================
-# MARKET DATA (BingX Futures)
+# MARKET DATA
 # =========================
 def _get_float(d: dict, keys: List[str], default: float = 0.0) -> float:
     for k in keys:
@@ -383,10 +376,7 @@ async def swap_tickers_24h() -> List[dict]:
     return d if isinstance(d, list) else []
 
 async def swap_klines(symbol: str, interval: str, limit: int = 210) -> List[dict]:
-    data = await fetch_bingx(
-        "/openApi/swap/v3/quote/klines",
-        params={"symbol": symbol, "interval": interval, "limit": str(limit)},
-    )
+    data = await fetch_bingx("/openApi/swap/v3/quote/klines", params={"symbol": symbol, "interval": interval, "limit": str(limit)})
     d = data.get("data", [])
     return d if isinstance(d, list) else []
 
@@ -429,8 +419,7 @@ def _parse_klines_to_ohlcv(kl: List[dict]) -> Tuple[List[float], List[float], Li
         vv = _get_float(x, ["v", "volume"], 0.0)
         if oo == 0 and cc == 0:
             continue
-        o.append(oo)
-        c.append(cc)
+        o.append(oo); c.append(cc)
         h.append(hh if hh else max(oo, cc))
         l.append(ll if ll else min(oo, cc))
         v.append(vv)
@@ -450,12 +439,7 @@ class Candidate:
     strict_ok: bool
     reason: str
 
-async def analyze_symbol(
-    symbol: str,
-    atr_min_pct: float,
-    vol_ratio_min: float,
-    overheat_max_pct: float,
-) -> Optional[Candidate]:
+async def analyze_symbol(symbol: str) -> Optional[Candidate]:
     t1 = asyncio.create_task(swap_klines(symbol, "1h", 210))
     t15 = asyncio.create_task(swap_klines(symbol, "15m", 210))
     t5 = asyncio.create_task(swap_klines(symbol, "5m", 140))
@@ -500,15 +484,7 @@ async def analyze_symbol(
     else:
         return None
 
-    # HARD FILTERS (adaptive for candidates)
-    if atr_pct < atr_min_pct:
-        return None
-    if vol_ratio < vol_ratio_min:
-        return None
-    if dist_pct > overheat_max_pct:
-        return None
-
-    # SCORE (0..10) stays "strict-style"
+    # SCORE 0..10 (penalize weak market instead of dropping everything)
     score = 0
     reasons = []
 
@@ -517,14 +493,18 @@ async def analyze_symbol(
 
     if atr_pct >= 0.45:
         score += 2
-    else:
+    elif atr_pct >= ATR_MIN_PCT:
         score += 1
+    else:
+        score += 0
     reasons.append(f"atr%={atr_pct:.2f}")
 
     if vol_ratio >= 1.50:
         score += 2
-    else:
+    elif vol_ratio >= VOL_RATIO_MIN:
         score += 1
+    else:
+        score += 0
     reasons.append(f"volx{vol_ratio:.2f}")
 
     score += 1
@@ -541,11 +521,14 @@ async def analyze_symbol(
 
     if dist_pct <= 0.8:
         score += 1
+    elif dist_pct <= OVERHEAT_DIST_MAX_PCT:
+        score += 0
+    else:
+        score -= 1
     reasons.append(f"dist={dist_pct:.2f}%")
 
     prob = clamp_int(score, 0, 10)
 
-    # STRICT_OK is ALWAYS computed by STRICT rules (entry rules unchanged)
     strict_ok = (
         (trend_up or trend_down)
         and (atr_pct >= ATR_MIN_PCT)
@@ -562,19 +545,10 @@ async def analyze_symbol(
         tp = entry * (1 - TP_PCT / 100.0)
         sl = entry * (1 + SL_PCT / 100.0)
 
-    return Candidate(
-        symbol=symbol,
-        side=side,
-        entry=entry,
-        tp=tp,
-        sl=sl,
-        prob=prob,
-        strict_ok=strict_ok,
-        reason="; ".join(reasons),
-    )
+    return Candidate(symbol, side, entry, tp, sl, prob, strict_ok, "; ".join(reasons))
 
-async def top_k_candidates(symbols: List[str], k: int, atr_min_pct: float, vol_ratio_min: float, overheat_max_pct: float) -> List[Candidate]:
-    tasks = [asyncio.create_task(analyze_symbol(s, atr_min_pct, vol_ratio_min, overheat_max_pct)) for s in symbols]
+async def top_k_candidates(symbols: List[str], k: int) -> List[Candidate]:
+    tasks = [asyncio.create_task(analyze_symbol(s)) for s in symbols]
     best: List[Candidate] = []
     try:
         for coro in asyncio.as_completed(tasks, timeout=SCAN_TIMEOUT_SECONDS):
@@ -647,8 +621,8 @@ async def start(m: Message):
         await m.answer(
             f"✅ Доступ активен до: <b>{fmt_until(until)}</b>\n"
             f"Рынок: <b>BingX Futures</b>\n"
-            f"Кнопка «Сигнал»: <b>Top-{SHOW_TOP_K} кандидата</b> + умный fallback\n"
-            f"Вход: только если <b>Prob ≥ {ENTRY_MIN_PROB}</b> и <b>Strict=OK</b>\n\n"
+            f"Кнопка «Сигнал»: всегда показывает <b>Top-{SHOW_TOP_K}</b> (даже вялый рынок)\n"
+            f"✅ Вход: только если <b>Prob ≥ {ENTRY_MIN_PROB}</b> и <b>Strict=OK</b>\n\n"
             f"😄 {joke(JOKES_OK)}",
             reply_markup=kb_user(m.from_user.id),
         )
@@ -680,11 +654,7 @@ async def request_access(cb: CallbackQuery):
         return
 
     try:
-        await bot.send_message(
-            ADMIN_ID,
-            f"🛂 Заявка на доступ от <code>{uid}</code>",
-            reply_markup=kb_admin_request(uid),
-        )
+        await bot.send_message(ADMIN_ID, f"🛂 Заявка на доступ от <code>{uid}</code>", reply_markup=kb_admin_request(uid))
     except Exception:
         pass
 
@@ -747,8 +717,9 @@ async def toggle_auto(cb: CallbackQuery):
 def format_candidate(c: Candidate, idx: int) -> str:
     ok_enter = (c.prob >= ENTRY_MIN_PROB) and c.strict_ok
     badge = "✅ <b>ВХОД</b>" if ok_enter else "⏳ <b>ЖДАТЬ</b>"
+    note = "" if c.strict_ok else "  <i>(наблюдение)</i>"
     return (
-        f"<b>#{idx} {c.symbol}</b>  {badge}\n"
+        f"<b>#{idx} {c.symbol}</b>  {badge}{note}\n"
         f"Side: <b>{c.side}</b> | Prob: <b>{c.prob}/10</b> | Strict: <b>{'OK' if c.strict_ok else 'NO'}</b>\n"
         f"Entry: <b>MARKET NOW</b> ≈ <code>{c.entry:.6f}</code>\n"
         f"TP: <code>{c.tp:.6f}</code> | SL: <code>{c.sl:.6f}</code>\n"
@@ -764,42 +735,26 @@ async def sig_now(cb: CallbackQuery):
         return
 
     await cb.answer("Анализирую…")
-    msg = await cb.message.answer("⏳ Первый проход (строго, только топ-ликвид)…")
+    msg = await cb.message.answer(f"⏳ {joke(JOKES_MANUAL)}")
 
     try:
-        # Pass 1: strict universe + strict minima
-        syms1 = await top_symbols(MIN_QUOTE_VOL_STRICT, TOP_N_STRICT, "strict")
-        cands = await top_k_candidates(
-            syms1,
-            SHOW_TOP_K,
-            ATR_MIN_PCT,
-            VOL_RATIO_MIN,
-            OVERHEAT_DIST_MAX_PCT,
-        )
+        # manual: broader symbol set so Top-3 almost always exists
+        syms_strict = await top_symbols(MIN_QUOTE_VOL_STRICT, TOP_N_STRICT, "strict")
+        syms_manual = await top_symbols(MIN_QUOTE_VOL_MANUAL, TOP_N_MANUAL_MAX, "manual")
+        syms = list(dict.fromkeys(syms_strict + syms_manual))  # keep order, unique
 
-        # If empty -> fallback pass (wider universe + relaxed minima), BUT entry rule unchanged
-        if not cands:
-            await msg.edit_text(f"Пока пусто по строгому проходу.\n\n😄 {joke(JOKES_FALLBACK)}")
-            syms2 = await top_symbols(MIN_QUOTE_VOL_FALLBACK, TOP_N_FALLBACK, "fallback")
-            cands = await top_k_candidates(
-                syms2,
-                SHOW_TOP_K,
-                ATR_MIN_PCT_FALLBACK,
-                VOL_RATIO_MIN_FALLBACK,
-                OVERHEAT_DIST_MAX_PCT_FALLBACK,
-            )
+        cands = await top_k_candidates(syms, SHOW_TOP_K)
 
         if not cands:
-            await msg.edit_text(f"Сейчас нет достойных кандидатов.\n\n😄 {joke(JOKES_NO)}")
+            await msg.edit_text(f"Сейчас даже широким поиском не нашёл нормальных движений.\n\n😄 {joke(JOKES_NO)}")
             return
 
-        # Log + message
         best_strict = pick_best_strict(cands)
 
         header = (
-            f"📣 <b>Лучшие кандидаты (Top-{SHOW_TOP_K})</b>\n"
+            f"📣 <b>Top-{SHOW_TOP_K} по рынку</b>\n"
             f"✅ Вход = <b>Prob ≥ {ENTRY_MIN_PROB}</b> и <b>Strict=OK</b>\n"
-            f"⚠️ Если Strict=NO — это <b>наблюдение</b>, не сигнал на вход.\n\n"
+            f"⚠️ Strict=NO — это <b>наблюдение</b>, не сигнал на вход.\n\n"
         )
 
         blocks = []
@@ -828,15 +783,7 @@ async def autoscan_loop():
             users = approved_users_for_broadcast()
             if users:
                 syms = await top_symbols(MIN_QUOTE_VOL_STRICT, TOP_N_STRICT, "strict")
-
-                # autoscan: strict minima ONLY
-                cands = await top_k_candidates(
-                    syms,
-                    SHOW_TOP_K,
-                    ATR_MIN_PCT,
-                    VOL_RATIO_MIN,
-                    OVERHEAT_DIST_MAX_PCT,
-                )
+                cands = await top_k_candidates(syms, SHOW_TOP_K)
 
                 best = None
                 if cands:
@@ -883,3 +830,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+```0
