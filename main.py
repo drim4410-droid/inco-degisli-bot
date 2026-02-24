@@ -1,10 +1,9 @@
 import os
 import time
 import asyncio
-import sqlite3
 import random
 from dataclasses import dataclass
-from typing import Optional, List, Tuple, Dict
+from typing import Optional, List, Dict
 
 import httpx
 from dotenv import load_dotenv
@@ -22,35 +21,35 @@ BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN missing. Set BOT_TOKEN in Railway Variables.")
-
-DB_PATH = "signals.db"
+    raise RuntimeError("BOT_TOKEN отсутствует. Добавь BOT_TOKEN в Railway Variables.")
+if ADMIN_ID == 0:
+    raise RuntimeError("ADMIN_ID отсутствует. Добавь ADMIN_ID (твой Telegram ID) в Railway Variables.")
 
 BINGX_BASE = "https://open-api.bingx.com"
 
-# Symbol universe
+# Universe / limits
 TOP_N_STRICT = 50
 TOP_N_MANUAL_MAX = 150
 MIN_QUOTE_VOL_STRICT = 50_000_000.0
 MIN_QUOTE_VOL_MANUAL = 10_000_000.0
 MIN_PRICE = 0.01
 
+# Manual output
+SHOW_TOP_K = 3
+ENTRY_MIN_PROB = 7  # вход только если prob >= 7 и strict_ok=True
+
 # Autoscan
 AUTO_SCAN_EVERY_MIN = 60
 AUTO_MIN_PROB = 7
-BROADCAST_COOLDOWN_SEC = 30 * 60
+BROADCAST_COOLDOWN_SEC = 30 * 60  # чтобы не спамить
 
-# Manual output
-SHOW_TOP_K = 3
-ENTRY_MIN_PROB = 7
-
-# HTTP
+# HTTP/stability
 HTTP_TIMEOUT = 25
 HTTP_CONCURRENCY = 4
 SCAN_TIMEOUT_SECONDS = 35
 TOPLIST_CACHE_TTL = 10 * 60
 
-# Strategy (STRICT gates)
+# Strategy strict gates
 ATR_MIN_PCT = 0.30
 VOL_RATIO_MIN = 1.10
 OVERHEAT_DIST_MAX_PCT = 1.20
@@ -63,6 +62,9 @@ RSI_SHORT_MAX = 45
 TP_PCT = 1.0
 SL_PCT = 0.5
 
+# =========================
+# BOT
+# =========================
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
@@ -70,194 +72,48 @@ HTTP_SEM = asyncio.Semaphore(HTTP_CONCURRENCY)
 HTTP_CLIENT: Optional[httpx.AsyncClient] = None
 
 TOP_CACHE: Dict[str, object] = {"ts": 0.0, "strict": [], "manual": []}
-LAST_BROADCAST = {"ts": 0}
+LAST_BROADCAST_TS = 0
 
 # =========================
-# JOKES (bright, no profanity)
+# TEXT (русский, без эмодзи)
 # =========================
 JOKES_OK = [
-    "Окей, это похоже на сетап. Но стоп ставим как взрослые.",
-    "План есть — уже победа. Теперь просто не мешай ему сработать.",
-    "Если зайдёшь — делай это по правилам, а не по эмоциям.",
-    "Свечи бодрые. Но депозит бодрее — бережём его.",
-    "Рынок дал шанс. Возьми его аккуратно.",
+    "Сетап выглядит бодро. Стоп обязателен.",
+    "План есть. Теперь не мешай ему сработать.",
+    "Входи по правилам, а не по эмоциям.",
+    "Дисциплина важнее одного сигнала.",
+    "Если входишь, не забывай про риск.",
 ]
 JOKES_WAIT = [
-    "Почти! Но «почти» не оплачивает PnL. Ждём подтверждение.",
-    "Сетап есть, но пока не красавчик. Терпение = деньги.",
-    "График намекает, но не говорит. Не угадываем.",
-    "Лучший трейд сейчас — не лезть и сохранить голову холодной.",
-    "Нужно ещё чуть-чуть фактов, не фантазий.",
+    "Почти. Но 'почти' не приносит прибыль. Ждем подтверждение.",
+    "Идея есть, но пока слабовато. Терпение.",
+    "Не угадываем. Ждем, пока рынок покажет намерение.",
+    "Лучше пропустить слабое, чем лечить депозит.",
+    "Рынок пока не дал нормального 'да'.",
 ]
 JOKES_NO = [
-    "Сегодня рынок без идей. Это тоже сигнал: НЕ входить.",
-    "Пусто. Лучше чай, чем минус.",
-    "Спектакль без сюжета. Мы уходим из зала.",
-    "Скука на графике — не повод искать приключения.",
-    "Ничего годного. Сохраняем депозит и нервы.",
+    "Сейчас ничего достойного. Это тоже сигнал: не входить.",
+    "Пусто. Лучше подождать, чем ловить шум.",
+    "Сетапов нет. Сохраняем депозит.",
+    "Рынок скучный. Не делаем лишних движений.",
+    "Ничего годного. Ждем.",
 ]
 JOKES_ERR = [
-    "Биржа задумалась. Дай ей минуту и попробуй снова.",
-    "Данные не приехали. Похоже, рынок в пробке.",
-    "Таймаут. BingX решил поиграть в прятки.",
+    "Биржа не ответила. Попробуй еще раз через минуту.",
+    "Ошибка данных. Похоже на таймаут/лимит.",
+    "Данные не пришли. Попробуй позже.",
 ]
 JOKES_MANUAL = [
-    "Ищу 3 самых адекватных места на рынке…",
-    "Сканирую рынок: кто сегодня реально двигается?",
-    "Запускаю анализ: без магии, только данные.",
+    "Запускаю анализ рынка. Ищу лучшие варианты.",
+    "Сканирую рынок: выбираю топ кандидатов.",
+    "Сейчас посмотрим, где есть движение.",
 ]
 
 def joke(arr: List[str]) -> str:
     return random.choice(arr)
 
-# =========================
-# DB
-# =========================
-def db() -> sqlite3.Connection:
-    return sqlite3.connect(DB_PATH)
-
-def init_db():
-    con = db()
-    cur = con.cursor()
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users(
-        user_id INTEGER PRIMARY KEY,
-        status TEXT NOT NULL DEFAULT 'PENDING',   -- PENDING/APPROVED/BANNED
-        access_until INTEGER NOT NULL DEFAULT 0,
-        autoscan INTEGER NOT NULL DEFAULT 1,
-        created_ts INTEGER NOT NULL DEFAULT 0
-    );
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS access_requests(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts INTEGER NOT NULL,
-        user_id INTEGER NOT NULL,
-        status TEXT NOT NULL DEFAULT 'PENDING'    -- PENDING/APPROVED/REJECTED
-    );
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS signals_log(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts INTEGER NOT NULL,
-        user_id INTEGER NOT NULL,                 -- 0 = autoscan/system
-        symbol TEXT NOT NULL,
-        side TEXT NOT NULL,
-        entry REAL NOT NULL,
-        tp REAL NOT NULL,
-        sl REAL NOT NULL,
-        prob INTEGER NOT NULL,                    -- 0..10
-        strict_ok INTEGER NOT NULL,               -- 0/1
-        reason TEXT NOT NULL
-    );
-    """)
-
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_users_status ON users(status, access_until);")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_req_status ON access_requests(status, ts);")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_log_ts ON signals_log(ts);")
-
-    con.commit()
-    con.close()
-
-def ensure_user(uid: int):
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT user_id FROM users WHERE user_id=?", (uid,))
-    if not cur.fetchone():
-        cur.execute(
-            "INSERT INTO users(user_id, status, access_until, autoscan, created_ts) VALUES(?,?,?,?,?)",
-            (uid, "PENDING", 0, 1, int(time.time())),
-        )
-    con.commit()
-    con.close()
-
-def is_admin(uid: int) -> bool:
-    return ADMIN_ID != 0 and uid == ADMIN_ID
-
-def user_active(uid: int) -> Tuple[bool, int]:
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT status, access_until FROM users WHERE user_id=?", (uid,))
-    r = cur.fetchone()
-    con.close()
-    if not r:
-        return False, 0
-    status, until = r[0], int(r[1])
-    return status == "APPROVED" and until > int(time.time()), until
-
-def set_autoscan(uid: int, enabled: bool):
-    con = db()
-    cur = con.cursor()
-    cur.execute("UPDATE users SET autoscan=? WHERE user_id=?", (1 if enabled else 0, uid))
-    con.commit()
-    con.close()
-
-def get_autoscan(uid: int) -> int:
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT autoscan FROM users WHERE user_id=?", (uid,))
-    r = cur.fetchone()
-    con.close()
-    return int(r[0]) if r else 1
-
-def create_access_request(uid: int) -> bool:
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT id FROM access_requests WHERE user_id=? AND status='PENDING' ORDER BY ts DESC LIMIT 1", (uid,))
-    if cur.fetchone():
-        con.close()
-        return False
-    cur.execute("INSERT INTO access_requests(ts, user_id, status) VALUES(?,?, 'PENDING')", (int(time.time()), uid))
-    con.commit()
-    con.close()
-    return True
-
-def approve_user(uid: int, days: int) -> int:
-    until = int(time.time()) + int(days) * 86400
-    con = db()
-    cur = con.cursor()
-    cur.execute("UPDATE users SET status='APPROVED', access_until=? WHERE user_id=?", (until, uid))
-    cur.execute("UPDATE access_requests SET status='APPROVED' WHERE user_id=? AND status='PENDING'", (uid,))
-    con.commit()
-    con.close()
-    return until
-
-def reject_user(uid: int):
-    con = db()
-    cur = con.cursor()
-    cur.execute("UPDATE access_requests SET status='REJECTED' WHERE user_id=? AND status='PENDING'", (uid,))
-    con.commit()
-    con.close()
-
-def approved_users_for_broadcast() -> List[int]:
-    now = int(time.time())
-    con = db()
-    cur = con.cursor()
-    cur.execute("""
-        SELECT user_id FROM users
-        WHERE status='APPROVED' AND access_until>? AND autoscan=1
-    """, (now,))
-    users = [int(r[0]) for r in cur.fetchall()]
-    con.close()
-    return users
-
-def log_signal(user_id: int, symbol: str, side: str, entry: float, tp: float, sl: float, prob: int, strict_ok: int, reason: str):
-    con = db()
-    cur = con.cursor()
-    cur.execute("""
-        INSERT INTO signals_log(ts, user_id, symbol, side, entry, tp, sl, prob, strict_ok, reason)
-        VALUES(?,?,?,?,?,?,?,?,?,?)
-    """, (int(time.time()), user_id, symbol, side, float(entry), float(tp), float(sl), int(prob), int(strict_ok), reason))
-    con.commit()
-    con.close()
-
-def fmt_until(ts: int) -> str:
-    if ts <= 0:
-        return "нет"
-    return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ts))
+def only_admin(uid: int) -> bool:
+    return uid == ADMIN_ID
 
 # =========================
 # HTTP (BingX)
@@ -413,7 +269,7 @@ async def top_symbols(min_quote_vol: float, top_n: int, cache_key: str) -> List[
     TOP_CACHE[cache_key] = syms
     return syms
 
-def _parse_klines(kl: List[dict]) -> Tuple[List[float], List[float], List[float], List[float], List[float]]:
+def _parse_klines(kl: List[dict]) -> tuple[List[float], List[float], List[float], List[float], List[float]]:
     o, h, l, c, v = [], [], [], [], []
     for x in kl:
         oo = _get_float(x, ["o", "open"], 0.0)
@@ -431,7 +287,7 @@ def _parse_klines(kl: List[dict]) -> Tuple[List[float], List[float], List[float]
     return o, h, l, c, v
 
 # =========================
-# STRATEGY
+# STRATEGY / SCORING
 # =========================
 @dataclass
 class Candidate:
@@ -490,7 +346,7 @@ async def analyze_symbol(symbol: str) -> Optional[Candidate]:
         return None
 
     score = 0
-    reasons = ["trend(1H+15m)"]
+    reasons = ["trend(1h+15m)"]
 
     if atr_pct >= 0.45:
         score += 2
@@ -505,7 +361,7 @@ async def analyze_symbol(symbol: str) -> Optional[Candidate]:
     reasons.append(f"volx{vol_ratio:.2f}")
 
     score += 1
-    reasons.append("5m_confirm")
+    reasons.append("confirm(5m)")
 
     rsi_ok = False
     if side == "LONG" and (RSI_LONG_MIN <= r5 <= RSI_LONG_MAX):
@@ -573,182 +429,47 @@ def pick_best_strict(cands: List[Candidate]) -> Optional[Candidate]:
     return strict[0]
 
 # =========================
-# KEYBOARDS
+# UI
 # =========================
-def kb_user(uid: int):
-    active_flag, _ = user_active(uid)
-    auto = get_autoscan(uid)
-
+def kb_admin_menu():
     kb = InlineKeyboardBuilder()
-    if active_flag:
-        kb.button(text="Сигнал", callback_data="sig_now")
-        kb.button(text=f"Авто: {'ON' if auto else 'OFF'}", callback_data="toggle_auto")
-    else:
-        kb.button(text="Запросить доступ", callback_data="request_access")
+    kb.button(text="Сигнал", callback_data="sig_now")
     kb.adjust(1)
     return kb.as_markup()
 
-def kb_admin_request(req_user_id: int):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="+7 дней", callback_data=f"approve:{req_user_id}:7")
-    kb.button(text="+15 дней", callback_data=f"approve:{req_user_id}:15")
-    kb.button(text="+30 дней", callback_data=f"approve:{req_user_id}:30")
-    kb.button(text="Отклонить", callback_data=f"reject:{req_user_id}")
-    kb.adjust(1)
-    return kb.as_markup()
-
-# =========================
-# START (command + text)
-# =========================
-async def send_start(m: Message):
-    init_db()
-    ensure_user(m.from_user.id)
-
-    if is_admin(m.from_user.id):
-        active_flag, _ = user_active(m.from_user.id)
-        if not active_flag:
-            until = approve_user(m.from_user.id, 3650)
-            await m.answer(f"Админ-доступ активирован до: <b>{fmt_until(until)}</b>", reply_markup=kb_user(m.from_user.id))
-            return
-
-    active_flag, until = user_active(m.from_user.id)
-    if active_flag:
-        await m.answer(
-            f"Доступ активен до: <b>{fmt_until(until)}</b>\n"
-            f"Биржа: <b>BingX Futures</b>\n"
-            f"Кнопка «Сигнал»: Top-{SHOW_TOP_K}\n"
-            f"Вход: только если <b>Prob ≥ {ENTRY_MIN_PROB}</b> и <b>Strict=OK</b>\n\n"
-            f"{joke(JOKES_OK)}",
-            reply_markup=kb_user(m.from_user.id),
-        )
-    else:
-        await m.answer(
-            "Доступ по одобрению.\nНажми «Запросить доступ» — мне придёт заявка с кнопками +7/+15/+30.",
-            reply_markup=kb_user(m.from_user.id),
-        )
-
-@dp.message(CommandStart())
-async def start_cmd(m: Message):
-    await send_start(m)
-
-@dp.message(F.text.lower().in_({"start", "старт"}))
-async def start_text(m: Message):
-    await send_start(m)
-
-@dp.message(Command("myid"))
-async def myid(m: Message):
-    await m.answer(f"ID: <code>{m.from_user.id}</code>")
-
-# =========================
-# ACCESS FLOW
-# =========================
-@dp.callback_query(F.data == "request_access")
-async def request_access(cb: CallbackQuery):
-    uid = cb.from_user.id
-    ensure_user(uid)
-    await cb.answer("OK")
-
-    created = create_access_request(uid)
-    if not created:
-        await cb.message.answer("У тебя уже есть активная заявка. Жди.", reply_markup=kb_user(uid))
-        return
-
-    await cb.message.answer("Заявка отправлена. Ожидай одобрения.", reply_markup=kb_user(uid))
-
-    if not ADMIN_ID:
-        await cb.message.answer("ADMIN_ID не задан. Добавь ADMIN_ID в Railway Variables и перезапусти.")
-        return
-
-    try:
-        await bot.send_message(
-            ADMIN_ID,
-            f"Заявка на доступ от <code>{uid}</code>",
-            reply_markup=kb_admin_request(uid),
-        )
-    except Exception:
-        pass
-
-@dp.callback_query(F.data.startswith("approve:"))
-async def approve_cb(cb: CallbackQuery):
-    if not is_admin(cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
-        return
-
-    parts = cb.data.split(":")
-    if len(parts) != 3:
-        await cb.answer("Ошибка", show_alert=True)
-        return
-
-    uid = int(parts[1])
-    days = int(parts[2])
-
-    ensure_user(uid)
-    until = approve_user(uid, days)
-
-    await cb.answer("Одобрено")
-    await cb.message.answer(f"Одобрено для <code>{uid}</code> на {days} дней (до {fmt_until(until)}).")
-
-    try:
-        await bot.send_message(uid, f"Доступ выдан на {days} дней.\nДо: <b>{fmt_until(until)}</b>\nНажми /start")
-    except Exception:
-        pass
-
-@dp.callback_query(F.data.startswith("reject:"))
-async def reject_cb(cb: CallbackQuery):
-    if not is_admin(cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
-        return
-
-    parts = cb.data.split(":")
-    if len(parts) != 2:
-        await cb.answer("Ошибка", show_alert=True)
-        return
-
-    uid = int(parts[1])
-    reject_user(uid)
-
-    await cb.answer("Отклонено")
-    await cb.message.answer(f"Отклонено для <code>{uid}</code>.")
-    try:
-        await bot.send_message(uid, "Доступ не одобрен.")
-    except Exception:
-        pass
-
-@dp.callback_query(F.data == "toggle_auto")
-async def toggle_auto(cb: CallbackQuery):
-    uid = cb.from_user.id
-    active_flag, _ = user_active(uid)
-    if not active_flag:
-        await cb.answer("Нет доступа", show_alert=True)
-        return
-
-    current = get_autoscan(uid)
-    new_val = 0 if current else 1
-    set_autoscan(uid, bool(new_val))
-
-    await cb.answer("OK")
-    await cb.message.answer(f"Автоанализ: <b>{'ON' if new_val else 'OFF'}</b>", reply_markup=kb_user(uid))
-
-# =========================
-# SIGNAL
-# =========================
 def format_candidate(c: Candidate, idx: int) -> str:
     ok_enter = (c.prob >= ENTRY_MIN_PROB) and c.strict_ok
     badge = "ВХОД" if ok_enter else "ЖДАТЬ"
     note = "" if c.strict_ok else " (наблюдение)"
     return (
-        f"<b>#{idx} {c.symbol}</b> — <b>{badge}</b>{note}\n"
-        f"Side: <b>{c.side}</b> | Prob: <b>{c.prob}/10</b> | Strict: <b>{'OK' if c.strict_ok else 'NO'}</b>\n"
-        f"Entry: <b>MARKET</b> ≈ <code>{c.entry:.6f}</code>\n"
+        f"<b>#{idx} {c.symbol}</b> - <b>{badge}</b>{note}\n"
+        f"Сторона: <b>{c.side}</b> | Вероятность: <b>{c.prob}/10</b> | Strict: <b>{'OK' if c.strict_ok else 'NO'}</b>\n"
+        f"Вход: <b>MARKET</b> ~= <code>{c.entry:.6f}</code>\n"
         f"TP: <code>{c.tp:.6f}</code> | SL: <code>{c.sl:.6f}</code>\n"
         f"<i>{c.reason}</i>"
     )
 
+# =========================
+# HANDLERS
+# =========================
+@dp.message(CommandStart())
+async def start_cmd(m: Message):
+    if not only_admin(m.from_user.id):
+        await m.answer("Этот бот приватный. Доступ запрещен.")
+        return
+    await m.answer(
+        "Бот активен. Нажми кнопку 'Сигнал' для принудительного анализа.\n"
+        f"Автоанализ: каждые {AUTO_SCAN_EVERY_MIN} минут (если есть сильный сигнал, он придет сюда).",
+        reply_markup=kb_admin_menu(),
+    )
+
+@dp.message(Command("myid"))
+async def myid(m: Message):
+    await m.answer(f"Твой ID: <code>{m.from_user.id}</code>")
+
 @dp.callback_query(F.data == "sig_now")
 async def sig_now(cb: CallbackQuery):
-    uid = cb.from_user.id
-    active_flag, _ = user_active(uid)
-    if not active_flag:
+    if not only_admin(cb.from_user.id):
         await cb.answer("Нет доступа", show_alert=True)
         return
 
@@ -763,70 +484,61 @@ async def sig_now(cb: CallbackQuery):
         cands = await top_k_candidates(syms, SHOW_TOP_K)
 
         if not cands:
-            await msg.edit_text(f"Сейчас нет достойных кандидатов.\n\n{joke(JOKES_NO)}")
+            await msg.edit_text("Сейчас нет достойных кандидатов.\n\n" + joke(JOKES_NO))
             return
 
         best_strict = pick_best_strict(cands)
 
         header = (
-            f"<b>Top-{SHOW_TOP_K} по рынку</b>\n"
-            f"Вход = <b>Prob ≥ {ENTRY_MIN_PROB}</b> и <b>Strict=OK</b>\n"
-            f"Strict=NO — наблюдение, не вход.\n\n"
+            f"<b>Топ-{SHOW_TOP_K} кандидата</b>\n"
+            f"Вход только если <b>Prob >= {ENTRY_MIN_PROB}</b> и <b>Strict=OK</b>\n"
+            f"Strict=NO - наблюдение, не вход.\n\n"
         )
 
-        blocks = []
-        for i, c in enumerate(cands, 1):
-            blocks.append(format_candidate(c, i))
-            log_signal(uid, c.symbol, c.side, c.entry, c.tp, c.sl, c.prob, 1 if c.strict_ok else 0, c.reason)
-
+        blocks = [format_candidate(c, i) for i, c in enumerate(cands, 1)]
         tail = joke(JOKES_OK) if (best_strict and best_strict.prob >= ENTRY_MIN_PROB) else joke(JOKES_WAIT)
-        await msg.edit_text(header + "\n\n".join(blocks) + f"\n\n{tail}")
-        await cb.message.answer("Меню:", reply_markup=kb_user(uid))
+
+        await msg.edit_text(header + "\n\n".join(blocks) + "\n\n" + tail)
 
     except Exception as e:
         print("SIGNAL ERROR:", repr(e))
-        await msg.edit_text(f"Ошибка при получении данных (BingX/таймаут/лимит). Попробуй ещё раз через минуту.\n\n{joke(JOKES_ERR)}")
+        await msg.edit_text("Ошибка данных (таймаут/лимит BingX). Попробуй еще раз через минуту.\n\n" + joke(JOKES_ERR))
 
 # =========================
-# AUTOSCAN (STRICT ONLY)
+# AUTOSCAN (только тебе)
 # =========================
 async def autoscan_loop():
+    global LAST_BROADCAST_TS
     while True:
         try:
-            users = approved_users_for_broadcast()
-            if users:
-                syms = await top_symbols(MIN_QUOTE_VOL_STRICT, TOP_N_STRICT, "strict")
-                cands = await top_k_candidates(syms, SHOW_TOP_K)
+            strict_syms = await top_symbols(MIN_QUOTE_VOL_STRICT, TOP_N_STRICT, "strict")
+            cands = await top_k_candidates(strict_syms, SHOW_TOP_K)
 
-                best = None
-                if cands:
-                    strict_best = pick_best_strict(cands)
-                    if strict_best and strict_best.prob >= AUTO_MIN_PROB:
-                        best = strict_best
+            best = None
+            if cands:
+                strict_best = pick_best_strict(cands)
+                if strict_best and strict_best.prob >= AUTO_MIN_PROB:
+                    best = strict_best
 
-                if best:
-                    now = int(time.time())
-                    if now - int(LAST_BROADCAST["ts"]) >= BROADCAST_COOLDOWN_SEC:
-                        LAST_BROADCAST["ts"] = now
-                        log_signal(0, best.symbol, best.side, best.entry, best.tp, best.sl, best.prob, 1, best.reason)
-
-                        text = (
-                            f"<b>Автоанализ (каждые {AUTO_SCAN_EVERY_MIN} минут)</b>\n\n"
-                            f"<b>{best.symbol}</b>\n"
-                            f"Side: <b>{best.side}</b>\n"
-                            f"Entry: <b>MARKET</b> ≈ <code>{best.entry:.6f}</code>\n"
-                            f"TP: <code>{best.tp:.6f}</code>\n"
-                            f"SL: <code>{best.sl:.6f}</code>\n"
-                            f"Вероятность: <b>{best.prob}/10</b>\n"
-                            f"<i>{best.reason}</i>\n\n"
-                            f"{joke(JOKES_OK)}"
-                        )
-
-                        for u in users:
-                            try:
-                                await bot.send_message(u, text, reply_markup=kb_user(u))
-                            except Exception:
-                                continue
+            if best:
+                now = int(time.time())
+                if now - int(LAST_BROADCAST_TS) >= BROADCAST_COOLDOWN_SEC:
+                    LAST_BROADCAST_TS = now
+                    text = (
+                        f"<b>Автоанализ (каждые {AUTO_SCAN_EVERY_MIN} минут)</b>\n\n"
+                        f"<b>{best.symbol}</b>\n"
+                        f"Сторона: <b>{best.side}</b>\n"
+                        f"Вход: <b>MARKET</b> ~= <code>{best.entry:.6f}</code>\n"
+                        f"TP: <code>{best.tp:.6f}</code>\n"
+                        f"SL: <code>{best.sl:.6f}</code>\n"
+                        f"Вероятность: <b>{best.prob}/10</b>\n"
+                        f"<i>{best.reason}</i>\n\n"
+                        f"{joke(JOKES_OK)}"
+                    )
+                    try:
+                        await bot.send_message(ADMIN_ID, text, reply_markup=kb_admin_menu())
+                    except Exception:
+                        pass
 
         except Exception as e:
             print("AUTOSCAN ERROR:", repr(e))
@@ -837,10 +549,8 @@ async def autoscan_loop():
 # MAIN
 # =========================
 async def main():
-    init_db()
     asyncio.create_task(autoscan_loop())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
-```0
