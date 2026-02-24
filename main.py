@@ -3,7 +3,7 @@ import time
 import asyncio
 import sqlite3
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
@@ -15,8 +15,11 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN missing")
 
 BINANCE = "https://api.binance.com"
 DB_PATH = "signals.db"
@@ -28,7 +31,6 @@ MIN_PRICE = 0.01
 DAILY_LIMIT = 5
 MAX_LOSS_STREAK = 2
 EVAL_BARS = 3
-AUTO_INTERVAL = 15
 TKM_OFFSET = 5 * 3600
 
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
@@ -67,20 +69,33 @@ def init_db():
     con.commit()
     con.close()
 
-def ensure_user(uid):
+def ensure_user(uid: int):
     con = db()
     cur = con.cursor()
     cur.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (uid,))
     con.commit()
     con.close()
 
-def active(uid):
+def approve(uid: int, days: int = 3650):
+    """Approve user for N days (default ~10 years for admin auto-approve)."""
+    until = int(time.time()) + int(days) * 86400
+    con = db()
+    cur = con.cursor()
+    cur.execute("UPDATE users SET status='APPROVED', access_until=? WHERE user_id=?", (until, uid))
+    con.commit()
+    con.close()
+    return until
+
+def active(uid: int) -> bool:
     con = db()
     cur = con.cursor()
     cur.execute("SELECT status, access_until FROM users WHERE user_id=?", (uid,))
     r = cur.fetchone()
     con.close()
-    return r and r[0] == "APPROVED" and r[1] > int(time.time())
+    return bool(r) and r[0] == "APPROVED" and int(r[1]) > int(time.time())
+
+def fmt_until(ts: int) -> str:
+    return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ts))
 
 # ================= INDICATORS =================
 
@@ -115,11 +130,11 @@ def atr(high, low, close, period=14):
                  abs(high[i] - close[i - 1]),
                  abs(low[i] - close[i - 1]))
         trs.append(tr)
-    atr = sum(trs[:period]) / period
-    out = [atr]
+    a = sum(trs[:period]) / period
+    out = [a]
     for i in range(period, len(trs)):
-        atr = (atr * (period - 1) + trs[i]) / period
-        out.append(atr)
+        a = (a * (period - 1) + trs[i]) / period
+        out.append(a)
     return [0] * (len(close) - len(out)) + out
 
 # ================= BINANCE =================
@@ -141,6 +156,9 @@ async def top_symbols():
         s = i["symbol"]
         if not s.endswith("USDT"):
             continue
+        # exclude leveraged tokens
+        if s.endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")):
+            continue
         vol = float(i["quoteVolume"])
         price = float(i["lastPrice"])
         if vol >= MIN_VOLUME and price >= MIN_PRICE:
@@ -148,7 +166,7 @@ async def top_symbols():
     arr.sort(key=lambda x: x[1], reverse=True)
     return [x[0] for x in arr[:TOP_N]]
 
-# ================= STRATEGY =================
+# ================= STRATEGY (STRICT) =================
 
 @dataclass
 class Signal:
@@ -158,10 +176,10 @@ class Signal:
     tp: float
     sl: float
 
-async def build_signal(symbol):
+async def build_signal(symbol) -> Optional[Signal]:
     k1 = await klines(symbol, "1h", 250)
     k15 = await klines(symbol, "15m", 250)
-    k5 = await klines(symbol, "5m", 100)
+    k5 = await klines(symbol, "5m", 120)
 
     c1 = [float(x[4]) for x in k1]
     c15 = [float(x[4]) for x in k15]
@@ -175,8 +193,8 @@ async def build_signal(symbol):
     ema200_15 = ema(c15, 200)[-1]
 
     atr15 = atr(h15, l15, c15)[-1]
-    atr_pct = atr15 / c15[-1] * 100
-    if atr_pct < 0.3:
+    atr_pct = (atr15 / c15[-1]) * 100 if c15[-1] else 0.0
+    if atr_pct < 0.30:
         return None
 
     trend_up = ema50_1 > ema200_1 and ema50_15 > ema200_15
@@ -212,14 +230,13 @@ def daily_control(uid):
     con.close()
 
     wins = losses = streak = 0
-    for r in rows:
-        if r[0] == "WIN":
+    for (st,) in rows:
+        if st == "WIN":
             streak = 0
             wins += 1
-        elif r[0] == "LOSE":
+        elif st == "LOSE":
             streak += 1
             losses += 1
-
     return wins, losses, streak
 
 # ================= EVALUATOR =================
@@ -228,11 +245,11 @@ async def evaluator():
     while True:
         con = db()
         cur = con.cursor()
-        cur.execute("SELECT id,symbol,side,tp,sl,ts FROM signals WHERE status='PENDING'")
+        cur.execute("SELECT id,symbol,side,tp,ts FROM signals WHERE status='PENDING'")
         rows = cur.fetchall()
         con.close()
 
-        for sid, sym, side, tp, sl, ts0 in rows:
+        for sid, sym, side, tp, ts0 in rows:
             if time.time() - ts0 < EVAL_BARS * 300:
                 continue
             try:
@@ -250,28 +267,85 @@ async def evaluator():
                 cur2.execute("UPDATE signals SET status=? WHERE id=?", (status, sid))
                 con2.commit()
                 con2.close()
-            except:
+            except Exception:
                 continue
 
         await asyncio.sleep(30)
 
-# ================= BOT =================
+# ================= UI =================
 
 def kb(uid):
-    kb = InlineKeyboardBuilder()
+    k = InlineKeyboardBuilder()
     if active(uid):
-        kb.button(text="📣 Сигнал", callback_data="signal")
-        kb.button(text="📊 Статистика", callback_data="stats")
+        k.button(text="📣 Сигнал", callback_data="signal")
+        k.button(text="📊 Статистика", callback_data="stats")
     else:
-        kb.button(text="📝 Запросить доступ", callback_data="req")
-    kb.adjust(1)
-    return kb.as_markup()
+        k.button(text="📝 Запросить доступ", callback_data="req")
+    k.adjust(1)
+    return k.as_markup()
 
-@dp.message(F.text == "/start")
+# ================= BOT =================
+
+@dp.message(F.text.in_({"/start", "start"}))
 async def start(m: Message):
     init_db()
     ensure_user(m.from_user.id)
+
+    # auto-approve admin instantly
+    if ADMIN_ID and m.from_user.id == ADMIN_ID and not active(ADMIN_ID):
+        until = approve(ADMIN_ID, days=3650)
+        await m.answer(f"✅ Админ доступ активирован до: <b>{fmt_until(until)}</b>", reply_markup=kb(m.from_user.id))
+        return
+
     await m.answer("Бот готов.", reply_markup=kb(m.from_user.id))
+
+@dp.message(F.text == "/myid")
+async def myid(m: Message):
+    await m.answer(f"ID: <code>{m.from_user.id}</code>")
+
+@dp.message(F.text.startswith("/approve"))
+async def cmd_approve(m: Message):
+    if not ADMIN_ID or m.from_user.id != ADMIN_ID:
+        return
+    parts = m.text.split()
+    if len(parts) != 3:
+        await m.answer("Формат: /approve USER_ID DAYS")
+        return
+    uid = int(parts[1])
+    days = int(parts[2])
+    ensure_user(uid)
+    until = approve(uid, days)
+    await m.answer(f"✅ Одобрено <code>{uid}</code> на {days} дней (до {fmt_until(until)})")
+    try:
+        await bot.send_message(uid, f"✅ Доступ выдан на {days} дней.\nНажми /start")
+    except Exception:
+        pass
+
+@dp.callback_query(F.data == "req")
+async def req(cb: CallbackQuery):
+    uid = cb.from_user.id
+    ensure_user(uid)
+
+    # Always respond + message in chat
+    await cb.answer("✅ Заявка отправлена")
+    await cb.message.answer("✅ Заявка отправлена админу. Ожидай одобрения.")
+
+    # If ADMIN_ID not set, inform user
+    if not ADMIN_ID:
+        await cb.message.answer("⚠️ ADMIN_ID не задан в Railway Variables. Задай ADMIN_ID и перезапусти сервис.")
+        return
+
+    # If user is admin, auto-approve
+    if uid == ADMIN_ID:
+        until = approve(uid, days=3650)
+        await cb.message.answer(f"✅ Ты админ. Доступ активирован до: <b>{fmt_until(until)}</b>", reply_markup=kb(uid))
+        return
+
+    # Notify admin
+    try:
+        await bot.send_message(ADMIN_ID, f"🛂 Запрос доступа от <code>{uid}</code>\nОдобрить: /approve {uid} 30")
+    except Exception:
+        pass
 
 @dp.callback_query(F.data == "signal")
 async def signal(cb: CallbackQuery):
@@ -282,16 +356,21 @@ async def signal(cb: CallbackQuery):
 
     wins, losses, streak = daily_control(uid)
     if streak >= MAX_LOSS_STREAK:
-        await cb.answer("Пауза до конца дня", show_alert=True)
+        await cb.answer("Пауза до конца дня (2 лося подряд)", show_alert=True)
         return
     if wins + losses >= DAILY_LIMIT:
-        await cb.answer("Дневной лимит", show_alert=True)
+        await cb.answer("Дневной лимит (5) достигнут", show_alert=True)
         return
+
+    await cb.answer("Сканирую Top-50…")
 
     syms = await top_symbols()
     for s in syms:
-        sig = await build_signal(s)
-        if sig:
+        try:
+            sig = await build_signal(s)
+            if not sig:
+                continue
+
             con = db()
             cur = con.cursor()
             cur.execute("""
@@ -302,31 +381,53 @@ async def signal(cb: CallbackQuery):
             con.close()
 
             await cb.message.answer(
-                f"{sig.symbol}\n{sig.side}\nEntry:{sig.entry}\nTP:{sig.tp}\nSL:{sig.sl}",
+                f"📣 <b>{sig.symbol}</b>\n"
+                f"{sig.side}\n"
+                f"Entry: <code>{sig.entry:.6f}</code>\n"
+                f"TP: <code>{sig.tp:.6f}</code>\n"
+                f"SL: <code>{sig.sl:.6f}</code>\n"
+                f"Оценка через {EVAL_BARS} свечи 5m",
                 reply_markup=kb(uid)
             )
             return
+        except Exception:
+            continue
 
-    await cb.answer("Нет сигнала")
+    await cb.message.answer("Сейчас нет подходящего сигнала.", reply_markup=kb(uid))
 
 @dp.callback_query(F.data == "stats")
 async def stats(cb: CallbackQuery):
+    uid = cb.from_user.id
+    if not active(uid):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
     con = db()
     cur = con.cursor()
     cur.execute("""
     SELECT
-    SUM(CASE WHEN status='WIN' THEN 1 ELSE 0 END),
-    SUM(CASE WHEN status='LOSE' THEN 1 ELSE 0 END),
-    COUNT(*)
-    FROM signals WHERE user_id=? AND status!='PENDING'
-    """, (cb.from_user.id,))
+      SUM(CASE WHEN status='WIN' THEN 1 ELSE 0 END),
+      SUM(CASE WHEN status='LOSE' THEN 1 ELSE 0 END),
+      COUNT(*)
+    FROM signals
+    WHERE user_id=? AND status!='PENDING'
+    """, (uid,))
     w, l, t = cur.fetchone()
     con.close()
-    w = w or 0
-    l = l or 0
-    t = t or 0
-    wr = (w / t * 100) if t else 0
-    await cb.message.answer(f"WIN:{w}\nLOSE:{l}\nВсего:{t}\nWinrate:{wr:.1f}%", reply_markup=kb(cb.from_user.id))
+
+    w = int(w or 0)
+    l = int(l or 0)
+    t = int(t or 0)
+    wr = (w / t * 100.0) if t else 0.0
+
+    await cb.answer()
+    await cb.message.answer(
+        f"📊 WIN: <b>{w}</b>\n"
+        f"📊 LOSE: <b>{l}</b>\n"
+        f"📊 TOTAL: <b>{t}</b>\n"
+        f"📊 Winrate: <b>{wr:.1f}%</b>",
+        reply_markup=kb(uid)
+    )
 
 # ================= MAIN =================
 
