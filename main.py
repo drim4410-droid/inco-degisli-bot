@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.filters import CommandStart, Command
 
 # =========================
 # CONFIG
@@ -352,7 +353,6 @@ def _get_float(d: dict, keys: List[str], default: float = 0.0) -> float:
     return default
 
 def symbol_allowed(sym: str) -> bool:
-    # BingX futures symbols look like "BTC-USDT"
     if not isinstance(sym, str) or "-" not in sym:
         return False
     base, quote = sym.split("-", 1)
@@ -363,13 +363,11 @@ def symbol_allowed(sym: str) -> bool:
     return True
 
 async def swap_tickers_24h() -> List[dict]:
-    # https://bingx.com/.../swap/v2/quote/ticker
     data = await fetch_bingx("/openApi/swap/v2/quote/ticker", params={})
     d = data.get("data", [])
     return d if isinstance(d, list) else []
 
 async def swap_klines(symbol: str, interval: str, limit: int = 210) -> List[dict]:
-    # https://bingx.com/.../swap/v3/quote/klines
     data = await fetch_bingx(
         "/openApi/swap/v3/quote/klines",
         params={"symbol": symbol, "interval": interval, "limit": str(limit)},
@@ -406,9 +404,6 @@ async def top_symbols() -> List[str]:
     return syms
 
 def _parse_klines_to_ohlcv(kl: List[dict]) -> Tuple[List[float], List[float], List[float], List[float], List[float]]:
-    """
-    Common BingX kline keys: o,c,h,l,v (strings)
-    """
     o, h, l, c, v = [], [], [], [], []
     for x in kl:
         oo = _get_float(x, ["o", "open"], 0.0)
@@ -435,12 +430,11 @@ class Candidate:
     entry: float
     tp: float
     sl: float
-    prob: int          # 0..10
-    strict_ok: bool    # STRICT filters passed?
+    prob: int
+    strict_ok: bool
     reason: str
 
 async def analyze_symbol(symbol: str) -> Optional[Candidate]:
-    # Fetch TF concurrently
     t1 = asyncio.create_task(swap_klines(symbol, "1h", 210))
     t15 = asyncio.create_task(swap_klines(symbol, "15m", 210))
     t5 = asyncio.create_task(swap_klines(symbol, "5m", 140))
@@ -453,7 +447,6 @@ async def analyze_symbol(symbol: str) -> Optional[Candidate]:
     if len(c1) < 210 or len(c15) < 210 or len(c5) < 50 or len(v15) < 60:
         return None
 
-    # Trend
     e50_1 = ema(c1, 50)[-1]
     e200_1 = ema(c1, 200)[-1]
     e50_15 = ema(c15, 50)[-1]
@@ -462,66 +455,54 @@ async def analyze_symbol(symbol: str) -> Optional[Candidate]:
     trend_up = (e50_1 > e200_1) and (e50_15 > e200_15)
     trend_down = (e50_1 < e200_1) and (e50_15 < e200_15)
 
-    # ATR%
     a15 = atr(h15, l15, c15, 14)[-1]
     atr_pct = (a15 / c15[-1]) * 100.0 if c15[-1] else 0.0
 
-    # Volume ratio
     last_vol = v15[-1]
     avg_vol = sum(v15[-50:]) / 50.0
     vol_ratio = (last_vol / avg_vol) if avg_vol > 0 else 0.0
 
-    # 5m confirmation + RSI
     last5 = c5[-1]
     prev5 = c5[-2]
     bullish5 = last5 > prev5
     bearish5 = last5 < prev5
     r5 = rsi(c5, 14)[-1]
 
-    # Distance from EMA50 15m (overheat)
     e50_15_last = ema(c15, 50)[-1]
     dist_pct = abs(c15[-1] - e50_15_last) / c15[-1] * 100.0 if c15[-1] else 999.0
 
-    # Decide side (we still can score candidates even if some filters weak)
     side: Optional[str] = None
     if trend_up and bullish5:
         side = "LONG"
     elif trend_down and bearish5:
         side = "SHORT"
     else:
-        # if no direction alignment, skip (too noisy)
         return None
 
-    # Score 0..10 (STRICT-based)
     score = 0
     reasons = []
 
-    # Trend alignment
     if trend_up or trend_down:
         score += 2
         reasons.append("trend(1H+15m)")
     else:
         reasons.append("no_trend")
 
-    # ATR strength
     if atr_pct >= 0.45:
         score += 2
     elif atr_pct >= ATR_MIN_PCT:
         score += 1
     reasons.append(f"atr%={atr_pct:.2f}")
 
-    # Volume impulse
     if vol_ratio >= 1.50:
         score += 2
     elif vol_ratio >= VOL_RATIO_MIN:
         score += 1
     reasons.append(f"volx{vol_ratio:.2f}")
 
-    # 5m candle confirmation
     score += 1
     reasons.append("5m_confirm")
 
-    # RSI zone (STRICT)
     rsi_ok = False
     if side == "LONG" and (RSI_LONG_MIN <= r5 <= RSI_LONG_MAX):
         score += 2
@@ -531,21 +512,18 @@ async def analyze_symbol(symbol: str) -> Optional[Candidate]:
         rsi_ok = True
     reasons.append(f"rsi={r5:.1f}")
 
-    # Not overheated
     if dist_pct <= 0.8:
         score += 1
     reasons.append(f"dist={dist_pct:.2f}%")
 
     prob = clamp_int(score, 0, 10)
 
-    # STRICT pass/fail
     strict_ok = (
         (trend_up or trend_down)
         and (atr_pct >= ATR_MIN_PCT)
         and (vol_ratio >= VOL_RATIO_MIN)
         and (dist_pct <= OVERHEAT_DIST_MAX_PCT)
         and rsi_ok
-        and ((side == "LONG" and bullish5) or (side == "SHORT" and bearish5))
     )
 
     entry = last5
@@ -556,16 +534,7 @@ async def analyze_symbol(symbol: str) -> Optional[Candidate]:
         tp = entry * (1 - TP_PCT / 100.0)
         sl = entry * (1 + SL_PCT / 100.0)
 
-    return Candidate(
-        symbol=symbol,
-        side=side,
-        entry=entry,
-        tp=tp,
-        sl=sl,
-        prob=prob,
-        strict_ok=strict_ok,
-        reason="; ".join(reasons),
-    )
+    return Candidate(symbol, side, entry, tp, sl, prob, strict_ok, "; ".join(reasons))
 
 async def top_k_candidates(symbols: List[str], k: int) -> List[Candidate]:
     tasks = [asyncio.create_task(analyze_symbol(s)) for s in symbols]
@@ -576,7 +545,6 @@ async def top_k_candidates(symbols: List[str], k: int) -> List[Candidate]:
                 res = await coro
                 if not res:
                     continue
-                # insert into best list sorted by prob desc
                 best.append(res)
                 best.sort(key=lambda x: x.prob, reverse=True)
                 if len(best) > k:
@@ -602,7 +570,7 @@ def pick_best_strict(cands: List[Candidate]) -> Optional[Candidate]:
 # KEYBOARDS
 # =========================
 def kb_user(uid: int):
-    active_flag, until = user_active(uid)
+    active_flag, _ = user_active(uid)
     auto = get_autoscan(uid)
 
     kb = InlineKeyboardBuilder()
@@ -624,14 +592,13 @@ def kb_admin_request(req_user_id: int):
     return kb.as_markup()
 
 # =========================
-# HANDLERS
+# HANDLERS (FIXED COMMANDS)
 # =========================
-@dp.message(F.text == "/start")
+@dp.message(CommandStart())
 async def start(m: Message):
     init_db()
     ensure_user(m.from_user.id)
 
-    # Auto-approve admin so you never get stuck
     if is_admin(m.from_user.id):
         active_flag, _ = user_active(m.from_user.id)
         if not active_flag:
@@ -645,7 +612,7 @@ async def start(m: Message):
             f"✅ Доступ активен до: <b>{fmt_until(until)}</b>\n"
             f"Рынок: <b>BingX Futures</b>\n"
             f"Режим: <b>STRICT + Top-{SHOW_TOP_K}</b>\n\n"
-            f"{MSG_READY()}",
+            f"😄 {joke(JOKES_OK)}",
             reply_markup=kb_user(m.from_user.id)
         )
     else:
@@ -655,7 +622,7 @@ async def start(m: Message):
             reply_markup=kb_user(m.from_user.id)
         )
 
-@dp.message(F.text == "/myid")
+@dp.message(Command("myid"))
 async def myid(m: Message):
     await m.answer(f"ID: <code>{m.from_user.id}</code>")
 
@@ -770,7 +737,6 @@ async def sig_now(cb: CallbackQuery):
 
     try:
         syms = await top_symbols()
-        # For speed: scan most liquid first, then if not enough candidates, scan the rest
         cands = await top_k_candidates(syms[:25], SHOW_TOP_K)
         if len(cands) < SHOW_TOP_K:
             more = await top_k_candidates(syms[25:], SHOW_TOP_K)
@@ -790,10 +756,8 @@ async def sig_now(cb: CallbackQuery):
         blocks = []
         for i, c in enumerate(cands, 1):
             blocks.append(format_candidate(c, i))
-            # log each candidate for the user
             log_signal(uid, c.symbol, c.side, c.entry, c.tp, c.sl, c.prob, 1 if c.strict_ok else 0, c.reason)
 
-        tail = ""
         if best_strict and best_strict.prob >= ENTRY_MIN_PROB:
             tail = f"\n\n😄 {joke(JOKES_OK)}"
         else:
@@ -804,7 +768,7 @@ async def sig_now(cb: CallbackQuery):
 
     except Exception as e:
         print("SIGNAL ERROR:", repr(e))
-        await msg.edit_text(f"{MSG_ERR()}\n\n😄 {joke(JOKES_ERR)}")
+        await msg.edit_text(f"Ошибка при получении данных (BingX/таймаут/лимит). Попробуй ещё раз через минуту.\n\n😄 {joke(JOKES_ERR)}")
 
 # =========================
 # AUTO SCAN LOOP
@@ -816,7 +780,6 @@ async def autoscan_loop():
             if users:
                 syms = await top_symbols()
 
-                # Scan more symbols for autoscan (quality), but keep time bounded
                 cands = await top_k_candidates(syms[:35], SHOW_TOP_K)
                 if len(cands) < SHOW_TOP_K:
                     more = await top_k_candidates(syms[35:], SHOW_TOP_K)
@@ -826,7 +789,6 @@ async def autoscan_loop():
 
                 best = None
                 if cands:
-                    # Prefer strict OK; otherwise no autosend
                     strict_best = pick_best_strict(cands)
                     if strict_best and strict_best.prob >= AUTO_MIN_PROB:
                         best = strict_best
@@ -871,4 +833,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-```0
