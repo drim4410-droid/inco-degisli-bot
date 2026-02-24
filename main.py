@@ -24,6 +24,12 @@ if not BOT_TOKEN:
 
 DB_PATH = "signals.db"
 
+# Style: "normal" or "sassy" (no profanity)
+TONE = os.getenv("TONE", "normal").strip().lower()
+
+# BingX OpenAPI base
+BINGX_BASE = "https://open-api.bingx.com"
+
 # Market universe
 TOP_N = 50
 MIN_QUOTE_VOL_USDT_24H = 50_000_000.0
@@ -35,9 +41,9 @@ AUTO_MIN_PROB = 7  # send autosignal only if prob >= 7/10
 BROADCAST_COOLDOWN_SEC = 30 * 60  # anti-spam
 
 # Speed / stability
-HTTP_TIMEOUT = 20
+HTTP_TIMEOUT = 25
 HTTP_CONCURRENCY = 4
-SCAN_TIMEOUT_SECONDS = 22
+SCAN_TIMEOUT_SECONDS = 25
 TOPLIST_CACHE_TTL = 10 * 60
 
 # Strategy strict thresholds
@@ -53,16 +59,6 @@ RSI_SHORT_MAX = 45
 TP_PCT = 1.0
 SL_PCT = 0.5
 
-# Timezone helper (for "day" if needed later)
-TKM_OFFSET = 5 * 3600
-
-BINANCE_APIS = [
-    "https://api.binance.com",
-    "https://api1.binance.com",
-    "https://api2.binance.com",
-    "https://api3.binance.com",
-]
-
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
@@ -72,6 +68,29 @@ HTTP_CLIENT: Optional[httpx.AsyncClient] = None
 TOP_CACHE: Dict[str, object] = {"ts": 0.0, "syms": []}
 LAST_BROADCAST = {"ts": 0}
 
+# =========================
+# TONE MESSAGES
+# =========================
+def say(normal: str, sassy: str) -> str:
+    return sassy if TONE == "sassy" else normal
+
+MSG_READY = lambda: say("Бот готов.", "Бот на месте. Погнали.")
+MSG_NO_SIGNAL = lambda: say(
+    "Сейчас нет сильного сигнала по STRICT фильтрам. Попробуй позже.",
+    "Сейчас рынок не даёт нормальный сетап. Не выдумывай входы — попробуй позже."
+)
+MSG_ANALYZING = lambda: say(
+    "⏳ Принудительный анализ рынка (BingX, STRICT)…",
+    "⏳ Сканирую рынок. Если сетапа нет — значит нет. Сейчас проверю."
+)
+MSG_AUTO_TITLE = lambda: say(
+    "🤖 Автоанализ (каждые 60 минут)",
+    "🤖 Автосканер: нашёл то, что похоже на нормальный сетап"
+)
+MSG_ERR = lambda: say(
+    "Ошибка при получении данных (BingX/таймаут/лимит). Попробуй ещё раз через минуту.",
+    "BingX тупит/лимитит/таймаут. Подожди минуту и повтори."
+)
 
 # =========================
 # DB
@@ -79,13 +98,11 @@ LAST_BROADCAST = {"ts": 0}
 def db() -> sqlite3.Connection:
     return sqlite3.connect(DB_PATH)
 
-
 def init_db():
     con = db()
     cur = con.cursor()
 
-    cur.execute(
-        """
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS users(
         user_id INTEGER PRIMARY KEY,
         status TEXT NOT NULL DEFAULT 'PENDING',       -- PENDING/APPROVED/BANNED
@@ -93,22 +110,18 @@ def init_db():
         autoscan INTEGER NOT NULL DEFAULT 1,
         created_ts INTEGER NOT NULL DEFAULT 0
     );
-    """
-    )
+    """)
 
-    cur.execute(
-        """
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS access_requests(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ts INTEGER NOT NULL,
         user_id INTEGER NOT NULL,
         status TEXT NOT NULL DEFAULT 'PENDING'        -- PENDING/APPROVED/REJECTED
     );
-    """
-    )
+    """)
 
-    cur.execute(
-        """
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS signals_log(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ts INTEGER NOT NULL,
@@ -121,8 +134,7 @@ def init_db():
         prob INTEGER NOT NULL,                        -- 0..10
         reason TEXT NOT NULL
     );
-    """
-    )
+    """)
 
     cur.execute("CREATE INDEX IF NOT EXISTS idx_users_status ON users(status, access_until);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_req_status ON access_requests(status, ts);")
@@ -130,7 +142,6 @@ def init_db():
 
     con.commit()
     con.close()
-
 
 def ensure_user(uid: int):
     con = db()
@@ -144,10 +155,8 @@ def ensure_user(uid: int):
     con.commit()
     con.close()
 
-
 def is_admin(uid: int) -> bool:
     return ADMIN_ID != 0 and uid == ADMIN_ID
-
 
 def user_active(uid: int) -> Tuple[bool, int]:
     con = db()
@@ -160,14 +169,12 @@ def user_active(uid: int) -> Tuple[bool, int]:
     status, until = r[0], int(r[1])
     return status == "APPROVED" and until > int(time.time()), until
 
-
 def set_autoscan(uid: int, enabled: bool):
     con = db()
     cur = con.cursor()
     cur.execute("UPDATE users SET autoscan=? WHERE user_id=?", (1 if enabled else 0, uid))
     con.commit()
     con.close()
-
 
 def get_autoscan(uid: int) -> int:
     con = db()
@@ -176,7 +183,6 @@ def get_autoscan(uid: int) -> int:
     r = cur.fetchone()
     con.close()
     return int(r[0]) if r else 1
-
 
 def create_access_request(uid: int) -> bool:
     con = db()
@@ -190,7 +196,6 @@ def create_access_request(uid: int) -> bool:
     con.close()
     return True
 
-
 def approve_user(uid: int, days: int) -> int:
     until = int(time.time()) + int(days) * 86400
     con = db()
@@ -201,7 +206,6 @@ def approve_user(uid: int, days: int) -> int:
     con.close()
     return until
 
-
 def reject_user(uid: int):
     con = db()
     cur = con.cursor()
@@ -209,42 +213,32 @@ def reject_user(uid: int):
     con.commit()
     con.close()
 
-
 def approved_users_for_broadcast() -> List[int]:
     now = int(time.time())
     con = db()
     cur = con.cursor()
-    cur.execute(
-        """
+    cur.execute("""
         SELECT user_id FROM users
         WHERE status='APPROVED' AND access_until>? AND autoscan=1
-        """,
-        (now,),
-    )
+    """, (now,))
     users = [int(r[0]) for r in cur.fetchall()]
     con.close()
     return users
 
-
 def log_signal(user_id: int, symbol: str, side: str, entry: float, tp: float, sl: float, prob: int, reason: str):
     con = db()
     cur = con.cursor()
-    cur.execute(
-        """
+    cur.execute("""
         INSERT INTO signals_log(ts, user_id, symbol, side, entry, tp, sl, prob, reason)
         VALUES(?,?,?,?,?,?,?,?,?)
-        """,
-        (int(time.time()), user_id, symbol, side, float(entry), float(tp), float(sl), int(prob), reason),
-    )
+    """, (int(time.time()), user_id, symbol, side, float(entry), float(tp), float(sl), int(prob), reason))
     con.commit()
     con.close()
-
 
 def fmt_until(ts: int) -> str:
     if ts <= 0:
         return "нет"
     return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ts))
-
 
 # =========================
 # HTTP
@@ -255,32 +249,39 @@ async def get_client() -> httpx.AsyncClient:
         HTTP_CLIENT = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
     return HTTP_CLIENT
 
+def ms() -> int:
+    return int(time.time() * 1000)
 
-async def fetch_json(path: str, params: Optional[dict] = None):
+async def fetch_bingx(path: str, params: Optional[dict] = None) -> dict:
+    if params is None:
+        params = {}
+    params = dict(params)
+    params.setdefault("timestamp", ms())
+
     last_err = None
-    for attempt in range(1, 4):  # retries
-        for base in BINANCE_APIS:  # fallback domains
-            url = f"{base}{path}"
-            try:
-                async with HTTP_SEM:
-                    client = await get_client()
-                    r = await client.get(url, params=params)
+    for attempt in range(1, 4):
+        try:
+            async with HTTP_SEM:
+                client = await get_client()
+                r = await client.get(f"{BINGX_BASE}{path}", params=params)
 
-                if r.status_code in (418, 429):
-                    raise httpx.HTTPStatusError(f"RateLimit {r.status_code}", request=r.request, response=r)
-                if r.status_code >= 500:
-                    raise httpx.HTTPStatusError(f"Server {r.status_code}", request=r.request, response=r)
+            if r.status_code in (418, 429):
+                raise httpx.HTTPStatusError(f"RateLimit {r.status_code}", request=r.request, response=r)
+            if r.status_code >= 500:
+                raise httpx.HTTPStatusError(f"Server {r.status_code}", request=r.request, response=r)
 
-                r.raise_for_status()
-                return r.json()
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, dict) and "code" in data and data.get("code") not in (0, "0"):
+                raise RuntimeError(f"BingX code={data.get('code')} msg={data.get('msg')}")
+            return data
 
-            except Exception as e:
-                last_err = e
-                await asyncio.sleep(0.4 * attempt)
+        except Exception as e:
+            last_err = e
+            await asyncio.sleep(0.5 * attempt)
 
-    print("FETCH ERROR:", repr(last_err))
+    print("BINGX FETCH ERROR:", repr(last_err))
     raise last_err
-
 
 # =========================
 # INDICATORS
@@ -293,7 +294,6 @@ def ema(values: List[float], period: int) -> List[float]:
     for v in values[1:]:
         out.append(alpha * v + (1 - alpha) * out[-1])
     return out
-
 
 def rsi(values: List[float], period: int = 14) -> List[float]:
     if len(values) < period + 2:
@@ -314,7 +314,6 @@ def rsi(values: List[float], period: int = 14) -> List[float]:
         rsi_vals.append(100.0 - (100.0 / (1.0 + rs)))
     return [50.0] * (len(values) - len(rsi_vals)) + rsi_vals
 
-
 def atr(high: List[float], low: List[float], close: List[float], period: int = 14) -> List[float]:
     if len(close) < period + 2:
         return [0.0] * len(close)
@@ -333,42 +332,65 @@ def atr(high: List[float], low: List[float], close: List[float], period: int = 1
         out.append(a)
     return [0.0] * (len(close) - len(out)) + out
 
-
 def clamp_int(x: float, lo: int, hi: int) -> int:
     return max(lo, min(hi, int(round(x))))
 
-
 # =========================
-# BINANCE DATA
+# BINGX MARKET DATA
 # =========================
 def symbol_allowed(sym: str) -> bool:
-    if not sym.endswith("USDT"):
+    if not isinstance(sym, str):
         return False
-    if sym.endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")):
+    if "-" not in sym:
         return False
-    base = sym[:-4]
+    base, quote = sym.split("-", 1)
+    if quote != "USDT":
+        return False
     if base in {"USDC", "TUSD", "FDUSD", "USDP", "DAI", "BUSD"}:
         return False
     return True
 
+async def swap_tickers_24h() -> List[dict]:
+    data = await fetch_bingx("/openApi/swap/v2/quote/ticker", params={})
+    d = data.get("data", [])
+    return d if isinstance(d, list) else []
+
+async def swap_klines(symbol: str, interval: str, limit: int = 210) -> List[dict]:
+    data = await fetch_bingx(
+        "/openApi/swap/v3/quote/klines",
+        params={"symbol": symbol, "interval": interval, "limit": str(limit)},
+    )
+    d = data.get("data", [])
+    return d if isinstance(d, list) else []
+
+def _get_float(d: dict, keys: List[str], default: float = 0.0) -> float:
+    for k in keys:
+        if k in d and d[k] is not None:
+            try:
+                return float(d[k])
+            except Exception:
+                continue
+    return default
 
 async def top_symbols() -> List[str]:
     now = time.time()
     if TOP_CACHE["syms"] and (now - float(TOP_CACHE["ts"])) < TOPLIST_CACHE_TTL:
         return list(TOP_CACHE["syms"])  # type: ignore
 
-    data = await fetch_json("/api/v3/ticker/24hr")
+    tickers = await swap_tickers_24h()
     arr = []
-    for i in data:
-        sym = i.get("symbol", "")
+    for t in tickers:
+        sym = t.get("symbol") or t.get("s") or ""
         if not symbol_allowed(sym):
             continue
-        try:
-            vol = float(i.get("quoteVolume", "0") or 0.0)
-            price = float(i.get("lastPrice", "0") or 0.0)
-        except Exception:
-            continue
-        if vol >= MIN_QUOTE_VOL_USDT_24H and price >= MIN_PRICE:
+
+        vol = _get_float(t, ["quoteVolume", "quoteVol", "qv", "turnover", "volumeQuote", "amount"], 0.0)
+        last = _get_float(t, ["lastPrice", "last", "close", "c"], 0.0)
+        base_vol = _get_float(t, ["volume", "v", "baseVolume"], 0.0)
+        if vol <= 0 and base_vol > 0 and last > 0:
+            vol = base_vol * last
+
+        if vol >= MIN_QUOTE_VOL_USDT_24H and last >= MIN_PRICE:
             arr.append((sym, vol))
 
     arr.sort(key=lambda x: x[1], reverse=True)
@@ -377,14 +399,6 @@ async def top_symbols() -> List[str]:
     TOP_CACHE["ts"] = now
     TOP_CACHE["syms"] = syms
     return syms
-
-
-async def klines(symbol: str, interval: str, limit: int = 210) -> List[list]:
-    return await fetch_json(
-        "/api/v3/klines",
-        {"symbol": symbol, "interval": interval, "limit": limit},
-    )
-
 
 # =========================
 # STRATEGY (STRICT + PROB 0..10)
@@ -399,23 +413,35 @@ class Signal:
     prob: int
     reason: str
 
+def _parse_klines_to_ohlcv(kl: List[dict]) -> Tuple[List[float], List[float], List[float], List[float], List[float]]:
+    o, h, l, c, v = [], [], [], [], []
+    for x in kl:
+        oo = _get_float(x, ["o", "open"], 0.0)
+        cc = _get_float(x, ["c", "close"], 0.0)
+        hh = _get_float(x, ["h", "high"], 0.0)
+        ll = _get_float(x, ["l", "low"], 0.0)
+        vv = _get_float(x, ["v", "volume"], 0.0)
+        if cc == 0 and oo == 0:
+            continue
+        o.append(oo)
+        c.append(cc)
+        h.append(hh if hh else max(oo, cc))
+        l.append(ll if ll else min(oo, cc))
+        v.append(vv)
+    return o, h, l, c, v
 
 async def build_strict_signal(symbol: str) -> Optional[Signal]:
-    t1 = asyncio.create_task(klines(symbol, "1h", 210))
-    t15 = asyncio.create_task(klines(symbol, "15m", 210))
-    t5 = asyncio.create_task(klines(symbol, "5m", 140))
+    t1 = asyncio.create_task(swap_klines(symbol, "1h", 210))
+    t15 = asyncio.create_task(swap_klines(symbol, "15m", 210))
+    t5 = asyncio.create_task(swap_klines(symbol, "5m", 140))
     k1, k15, k5 = await asyncio.gather(t1, t15, t5)
 
-    if len(k1) < 210 or len(k15) < 210 or len(k5) < 50:
+    _, _, _, c1, _ = _parse_klines_to_ohlcv(k1)
+    _, h15, l15, c15, v15 = _parse_klines_to_ohlcv(k15)
+    _, _, _, c5, _ = _parse_klines_to_ohlcv(k5)
+
+    if len(c1) < 210 or len(c15) < 210 or len(c5) < 50 or len(v15) < 60:
         return None
-
-    c1 = [float(x[4]) for x in k1]
-    c15 = [float(x[4]) for x in k15]
-    c5 = [float(x[4]) for x in k5]
-
-    h15 = [float(x[2]) for x in k15]
-    l15 = [float(x[3]) for x in k15]
-    v15 = [float(x[5]) for x in k15]
 
     e50_1 = ema(c1, 50)[-1]
     e200_1 = ema(c1, 200)[-1]
@@ -433,7 +459,7 @@ async def build_strict_signal(symbol: str) -> Optional[Signal]:
         return None
 
     last_vol = v15[-1]
-    avg_vol = sum(v15[-50:]) / 50.0 if len(v15) >= 50 else (sum(v15) / max(1.0, len(v15)))
+    avg_vol = sum(v15[-50:]) / 50.0
     vol_ratio = (last_vol / avg_vol) if avg_vol > 0 else 0.0
     if vol_ratio < VOL_RATIO_MIN:
         return None
@@ -446,7 +472,6 @@ async def build_strict_signal(symbol: str) -> Optional[Signal]:
         return None
 
     r5 = rsi(c5, 14)[-1]
-
     e50_15_last = ema(c15, 50)[-1]
     dist_pct = abs(c15[-1] - e50_15_last) / c15[-1] * 100.0 if c15[-1] else 0.0
     if dist_pct > OVERHEAT_DIST_MAX_PCT:
@@ -498,16 +523,7 @@ async def build_strict_signal(symbol: str) -> Optional[Signal]:
         tp = entry * (1 - TP_PCT / 100.0)
         sl = entry * (1 + SL_PCT / 100.0)
 
-    return Signal(
-        symbol=symbol,
-        side=side,
-        entry=entry,
-        tp=tp,
-        sl=sl,
-        prob=prob,
-        reason="; ".join(reasons),
-    )
-
+    return Signal(symbol=symbol, side=side, entry=entry, tp=tp, sl=sl, prob=prob, reason="; ".join(reasons))
 
 async def find_best_signal(symbols: List[str]) -> Optional[Signal]:
     tasks = [asyncio.create_task(build_strict_signal(s)) for s in symbols]
@@ -532,7 +548,6 @@ async def find_best_signal(symbols: List[str]) -> Optional[Signal]:
                 t.cancel()
     return best
 
-
 # =========================
 # KEYBOARDS
 # =========================
@@ -549,7 +564,6 @@ def kb_user(uid: int):
     kb.adjust(1)
     return kb.as_markup()
 
-
 def kb_admin_request(req_user_id: int):
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ +7 дней", callback_data=f"approve:{req_user_id}:7")
@@ -558,7 +572,6 @@ def kb_admin_request(req_user_id: int):
     kb.button(text="❌ Отклонить", callback_data=f"reject:{req_user_id}")
     kb.adjust(1)
     return kb.as_markup()
-
 
 # =========================
 # BOT HANDLERS
@@ -581,7 +594,7 @@ async def start(m: Message):
     active_flag, until = user_active(m.from_user.id)
     if active_flag:
         await m.answer(
-            f"✅ Доступ активен до: <b>{fmt_until(until)}</b>\nРежим: <b>STRICT</b>",
+            f"✅ Доступ активен до: <b>{fmt_until(until)}</b>\nРежим: <b>STRICT (BingX)</b>",
             reply_markup=kb_user(m.from_user.id),
         )
     else:
@@ -590,30 +603,9 @@ async def start(m: Message):
             reply_markup=kb_user(m.from_user.id),
         )
 
-
 @dp.message(F.text == "/myid")
 async def myid(m: Message):
     await m.answer(f"ID: <code>{m.from_user.id}</code>")
-
-
-@dp.message(F.text.startswith("/approve"))
-async def cmd_approve(m: Message):
-    if not is_admin(m.from_user.id):
-        return
-    parts = m.text.split()
-    if len(parts) != 3:
-        await m.answer("Формат: /approve USER_ID DAYS")
-        return
-    uid = int(parts[1])
-    days = int(parts[2])
-    ensure_user(uid)
-    until = approve_user(uid, days)
-    await m.answer(f"✅ Одобрено для <code>{uid}</code> на {days} дней (до {fmt_until(until)}).")
-    try:
-        await bot.send_message(uid, f"✅ Доступ выдан на {days} дней.\nНажми /start")
-    except Exception:
-        pass
-
 
 @dp.callback_query(F.data == "request_access")
 async def request_access(cb: CallbackQuery):
@@ -642,7 +634,6 @@ async def request_access(cb: CallbackQuery):
     except Exception:
         pass
 
-
 @dp.callback_query(F.data.startswith("approve:"))
 async def approve_cb(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
@@ -668,7 +659,6 @@ async def approve_cb(cb: CallbackQuery):
     except Exception:
         pass
 
-
 @dp.callback_query(F.data.startswith("reject:"))
 async def reject_cb(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
@@ -690,7 +680,6 @@ async def reject_cb(cb: CallbackQuery):
     except Exception:
         pass
 
-
 @dp.callback_query(F.data == "toggle_auto")
 async def toggle_auto(cb: CallbackQuery):
     uid = cb.from_user.id
@@ -706,7 +695,6 @@ async def toggle_auto(cb: CallbackQuery):
     await cb.answer("Ок")
     await cb.message.answer(f"🤖 Автоанализ: <b>{'ON' if new_val else 'OFF'}</b>", reply_markup=kb_user(uid))
 
-
 @dp.callback_query(F.data == "sig_now")
 async def sig_now(cb: CallbackQuery):
     uid = cb.from_user.id
@@ -716,7 +704,7 @@ async def sig_now(cb: CallbackQuery):
         return
 
     await cb.answer("Анализирую…")
-    msg = await cb.message.answer("⏳ Принудительный анализ рынка (STRICT)…")
+    msg = await cb.message.answer(MSG_ANALYZING())
 
     try:
         syms = await top_symbols()
@@ -725,7 +713,7 @@ async def sig_now(cb: CallbackQuery):
             best = await find_best_signal(syms[20:])
 
         if not best:
-            await msg.edit_text("Сейчас нет сильного сигнала по STRICT фильтрам. Попробуй позже.")
+            await msg.edit_text(MSG_NO_SIGNAL())
             return
 
         log_signal(uid, best.symbol, best.side, best.entry, best.tp, best.sl, best.prob, best.reason)
@@ -743,8 +731,7 @@ async def sig_now(cb: CallbackQuery):
 
     except Exception as e:
         print("SIGNAL ERROR:", repr(e))
-        await msg.edit_text("Ошибка при получении данных (Binance/таймаут). Попробуй ещё раз через минуту.")
-
+        await msg.edit_text(MSG_ERR())
 
 # =========================
 # AUTO SCAN LOOP
@@ -763,10 +750,11 @@ async def autoscan_loop():
                     now = int(time.time())
                     if now - int(LAST_BROADCAST["ts"]) >= BROADCAST_COOLDOWN_SEC:
                         LAST_BROADCAST["ts"] = now
+
                         log_signal(0, best.symbol, best.side, best.entry, best.tp, best.sl, best.prob, best.reason)
 
                         text = (
-                            f"🤖 <b>Автоанализ (каждые 60 минут)</b>\n\n"
+                            f"{MSG_AUTO_TITLE()}\n\n"
                             f"📣 <b>{best.symbol}</b>\n"
                             f"Направление: <b>{best.side}</b>\n"
                             f"Вход: <b>MARKET NOW</b> ≈ <code>{best.entry:.6f}</code>\n"
@@ -787,7 +775,6 @@ async def autoscan_loop():
 
         await asyncio.sleep(AUTO_SCAN_EVERY_MIN * 60)
 
-
 # =========================
 # MAIN
 # =========================
@@ -795,7 +782,6 @@ async def main():
     init_db()
     asyncio.create_task(autoscan_loop())
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
