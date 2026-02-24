@@ -20,7 +20,6 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
-
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN missing. Set BOT_TOKEN in Railway Variables.")
 
@@ -30,8 +29,10 @@ DB_PATH = "signals.db"
 BINGX_BASE = "https://open-api.bingx.com"
 
 # Universe
-TOP_N = 50
-MIN_QUOTE_VOL_USDT_24H = 50_000_000.0
+TOP_N_STRICT = 50           # first pass
+TOP_N_FALLBACK = 150        # fallback pass (manual button only)
+MIN_QUOTE_VOL_STRICT = 50_000_000.0
+MIN_QUOTE_VOL_FALLBACK = 10_000_000.0
 MIN_PRICE = 0.01
 
 # Auto scan
@@ -41,15 +42,15 @@ BROADCAST_COOLDOWN_SEC = 30 * 60
 
 # Manual signal output
 SHOW_TOP_K = 3
-ENTRY_MIN_PROB = 7  # "можно входить" если >= 7/10
+ENTRY_MIN_PROB = 7          # "можно входить" если >= 7/10 и Strict=OK
 
 # Speed / stability
 HTTP_TIMEOUT = 25
 HTTP_CONCURRENCY = 4
-SCAN_TIMEOUT_SECONDS = 28
+SCAN_TIMEOUT_SECONDS = 30
 TOPLIST_CACHE_TTL = 10 * 60
 
-# Strategy scoring thresholds (STRICT)
+# Strategy thresholds (STRICT)
 ATR_MIN_PCT = 0.30
 VOL_RATIO_MIN = 1.10
 OVERHEAT_DIST_MAX_PCT = 1.20
@@ -57,6 +58,11 @@ RSI_LONG_MIN = 55
 RSI_LONG_MAX = 70
 RSI_SHORT_MIN = 30
 RSI_SHORT_MAX = 45
+
+# Fallback loosen (manual button only; entry rules DO NOT change)
+ATR_MIN_PCT_FALLBACK = ATR_MIN_PCT * 0.80
+VOL_RATIO_MIN_FALLBACK = VOL_RATIO_MIN * 0.90
+OVERHEAT_DIST_MAX_PCT_FALLBACK = 1.60
 
 # TP/SL (for "market now" idea)
 TP_PCT = 1.0
@@ -68,36 +74,45 @@ dp = Dispatcher()
 HTTP_SEM = asyncio.Semaphore(HTTP_CONCURRENCY)
 HTTP_CLIENT: Optional[httpx.AsyncClient] = None
 
-TOP_CACHE: Dict[str, object] = {"ts": 0.0, "syms": []}
+TOP_CACHE: Dict[str, object] = {"ts": 0.0, "strict": [], "fallback": []}
 LAST_BROADCAST = {"ts": 0}
 
 # =========================
-# JOKES (no profanity)
+# BRIGHT JOKES (no profanity)
 # =========================
 JOKES_OK = [
-    "Свечи улыбнулись — но стоп всё равно ставим 🙂",
-    "Рынок: «держи сетап». Мы: «спасибо, но с риском».",
-    "Когда есть сигнал — главное не испортить руками.",
-    "Да, это похоже на сетап. Нет, это не повод отключать мозг.",
-    "Быки/медведи спорят — мы просто следуем плану.",
+    "🔥 Сетап выглядит бодро. Но стоп ставим как взрослые.",
+    "🧠 План есть? Есть. Тогда руки не трясём — действуем по правилам.",
+    "🚀 Если это отработает — свечи официально красавчики. Если нет — стоп спасёт.",
+    "🎯 Тут уже похоже на «можно». Только без геройства, ок?",
+    "🐂🐻 Быки и медведи дерутся — мы просто забираем свой кусочек.",
 ]
 JOKES_WAIT = [
-    "Сетап не дозрел. Рынок просит ещё минутку.",
-    "Пока без фанатизма — лучше подождать, чем догонять.",
-    "Тут пахнет сигналом, но пока не пахнет уверенностью.",
-    "Слабовато. График как будто шепчет, а не говорит.",
+    "⏳ Почти-почти… но рынок пока жмёт паузу. Ждём подтверждение.",
+    "👀 Пахнет сигналом, но пока больше пахнет «не лезь».",
+    "🧊 Холодная голова: лучше пропустить слабое, чем лечить депозит.",
+    "🕵️‍♂️ Сетап есть, но не красавец. Смотри, не влюбись в график.",
+    "🎭 Рынок как актёр: делает вид, что даёт вход. Мы не ведёмся.",
 ]
 JOKES_NO = [
-    "Сигнала нет. Рынок сказал: «чай/вода/прогулка».",
-    "Сегодня график играет в молчанку. Мы не ломаем дверь.",
-    "Ничего годного — это тоже хороший сигнал: НЕ входить.",
-    "Свечи сегодня без настроения. И это нормально.",
+    "🍵 Сигналов нет. Рынок выдал официальную справку: «Отдыхай».",
+    "🧱 Здесь входить — это как лбом стену тестить. Не надо.",
+    "🦉 Сегодня мудрый день: ничего не делать — тоже стратегия.",
+    "📉📈 График устроил спектакль без сюжета. Мы уходим из зала.",
+    "🧯 Ничего годного — значит сохраняем депозит, а не эмоции.",
 ]
 JOKES_ERR = [
-    "Биржа задумалась. Бывает даже у взрослых.",
-    "Данные не пришли — свечи ушли на перекур.",
-    "Таймаут. Рынок решил поиграть в прятки.",
+    "📡 Биржа зависла. Свечи, видимо, грузятся по модему.",
+    "🛠️ Данные не приехали. Рынок в ремонте на 30 секунд.",
+    "🙃 Таймаут. BingX решил сыграть в «поймай меня, если сможешь».",
 ]
+
+JOKES_FALLBACK = [
+    "🧪 Включаю режим «детектив»: расширяю поиск и копаю глубже…",
+    "🔍 Первый проход пустой. Делаю второй — более широкий и умный.",
+    "🧹 Уберём лишний шум и посмотрим, где хоть что-то шевелится…",
+]
+
 def joke(arr: List[str]) -> str:
     return random.choice(arr)
 
@@ -287,7 +302,7 @@ async def fetch_bingx(path: str, params: Optional[dict] = None) -> dict:
             return data
         except Exception as e:
             last_err = e
-            await asyncio.sleep(0.5 * attempt)
+            await asyncio.sleep(0.6 * attempt)
 
     print("BINGX FETCH ERROR:", repr(last_err))
     raise last_err
@@ -375,10 +390,11 @@ async def swap_klines(symbol: str, interval: str, limit: int = 210) -> List[dict
     d = data.get("data", [])
     return d if isinstance(d, list) else []
 
-async def top_symbols() -> List[str]:
+async def top_symbols(min_quote_vol: float, top_n: int, cache_key: str) -> List[str]:
     now = time.time()
-    if TOP_CACHE["syms"] and (now - float(TOP_CACHE["ts"])) < TOPLIST_CACHE_TTL:
-        return list(TOP_CACHE["syms"])  # type: ignore
+    cached = TOP_CACHE.get(cache_key, [])
+    if cached and (now - float(TOP_CACHE["ts"])) < TOPLIST_CACHE_TTL:
+        return list(cached)  # type: ignore
 
     tickers = await swap_tickers_24h()
     arr = []
@@ -393,14 +409,14 @@ async def top_symbols() -> List[str]:
         if vol_quote <= 0 and vol_base > 0 and last > 0:
             vol_quote = vol_base * last
 
-        if last >= MIN_PRICE and vol_quote >= MIN_QUOTE_VOL_USDT_24H:
+        if last >= MIN_PRICE and vol_quote >= min_quote_vol:
             arr.append((sym, vol_quote))
 
     arr.sort(key=lambda x: x[1], reverse=True)
-    syms = [x[0] for x in arr[:TOP_N]]
+    syms = [x[0] for x in arr[:top_n]]
 
     TOP_CACHE["ts"] = now
-    TOP_CACHE["syms"] = syms
+    TOP_CACHE[cache_key] = syms
     return syms
 
 def _parse_klines_to_ohlcv(kl: List[dict]) -> Tuple[List[float], List[float], List[float], List[float], List[float]]:
@@ -434,7 +450,12 @@ class Candidate:
     strict_ok: bool
     reason: str
 
-async def analyze_symbol(symbol: str) -> Optional[Candidate]:
+async def analyze_symbol(
+    symbol: str,
+    atr_min_pct: float,
+    vol_ratio_min: float,
+    overheat_max_pct: float,
+) -> Optional[Candidate]:
     t1 = asyncio.create_task(swap_klines(symbol, "1h", 210))
     t15 = asyncio.create_task(swap_klines(symbol, "15m", 210))
     t5 = asyncio.create_task(swap_klines(symbol, "5m", 140))
@@ -479,24 +500,30 @@ async def analyze_symbol(symbol: str) -> Optional[Candidate]:
     else:
         return None
 
+    # HARD FILTERS (adaptive for candidates)
+    if atr_pct < atr_min_pct:
+        return None
+    if vol_ratio < vol_ratio_min:
+        return None
+    if dist_pct > overheat_max_pct:
+        return None
+
+    # SCORE (0..10) stays "strict-style"
     score = 0
     reasons = []
 
-    if trend_up or trend_down:
-        score += 2
-        reasons.append("trend(1H+15m)")
-    else:
-        reasons.append("no_trend")
+    score += 2
+    reasons.append("trend(1H+15m)")
 
     if atr_pct >= 0.45:
         score += 2
-    elif atr_pct >= ATR_MIN_PCT:
+    else:
         score += 1
     reasons.append(f"atr%={atr_pct:.2f}")
 
     if vol_ratio >= 1.50:
         score += 2
-    elif vol_ratio >= VOL_RATIO_MIN:
+    else:
         score += 1
     reasons.append(f"volx{vol_ratio:.2f}")
 
@@ -518,6 +545,7 @@ async def analyze_symbol(symbol: str) -> Optional[Candidate]:
 
     prob = clamp_int(score, 0, 10)
 
+    # STRICT_OK is ALWAYS computed by STRICT rules (entry rules unchanged)
     strict_ok = (
         (trend_up or trend_down)
         and (atr_pct >= ATR_MIN_PCT)
@@ -534,10 +562,19 @@ async def analyze_symbol(symbol: str) -> Optional[Candidate]:
         tp = entry * (1 - TP_PCT / 100.0)
         sl = entry * (1 + SL_PCT / 100.0)
 
-    return Candidate(symbol, side, entry, tp, sl, prob, strict_ok, "; ".join(reasons))
+    return Candidate(
+        symbol=symbol,
+        side=side,
+        entry=entry,
+        tp=tp,
+        sl=sl,
+        prob=prob,
+        strict_ok=strict_ok,
+        reason="; ".join(reasons),
+    )
 
-async def top_k_candidates(symbols: List[str], k: int) -> List[Candidate]:
-    tasks = [asyncio.create_task(analyze_symbol(s)) for s in symbols]
+async def top_k_candidates(symbols: List[str], k: int, atr_min_pct: float, vol_ratio_min: float, overheat_max_pct: float) -> List[Candidate]:
+    tasks = [asyncio.create_task(analyze_symbol(s, atr_min_pct, vol_ratio_min, overheat_max_pct)) for s in symbols]
     best: List[Candidate] = []
     try:
         for coro in asyncio.as_completed(tasks, timeout=SCAN_TIMEOUT_SECONDS):
@@ -572,7 +609,6 @@ def pick_best_strict(cands: List[Candidate]) -> Optional[Candidate]:
 def kb_user(uid: int):
     active_flag, _ = user_active(uid)
     auto = get_autoscan(uid)
-
     kb = InlineKeyboardBuilder()
     if active_flag:
         kb.button(text="📣 Сигнал", callback_data="sig_now")
@@ -592,7 +628,7 @@ def kb_admin_request(req_user_id: int):
     return kb.as_markup()
 
 # =========================
-# HANDLERS (FIXED COMMANDS)
+# HANDLERS
 # =========================
 @dp.message(CommandStart())
 async def start(m: Message):
@@ -611,15 +647,15 @@ async def start(m: Message):
         await m.answer(
             f"✅ Доступ активен до: <b>{fmt_until(until)}</b>\n"
             f"Рынок: <b>BingX Futures</b>\n"
-            f"Режим: <b>STRICT + Top-{SHOW_TOP_K}</b>\n\n"
+            f"Кнопка «Сигнал»: <b>Top-{SHOW_TOP_K} кандидата</b> + умный fallback\n"
+            f"Вход: только если <b>Prob ≥ {ENTRY_MIN_PROB}</b> и <b>Strict=OK</b>\n\n"
             f"😄 {joke(JOKES_OK)}",
-            reply_markup=kb_user(m.from_user.id)
+            reply_markup=kb_user(m.from_user.id),
         )
     else:
         await m.answer(
-            "⛔️ Доступ по одобрению.\n"
-            "Нажми «Запросить доступ» — мне придёт заявка с кнопками +7/+15/+30.",
-            reply_markup=kb_user(m.from_user.id)
+            "⛔️ Доступ по одобрению.\nНажми «Запросить доступ» — мне придёт заявка с кнопками +7/+15/+30.",
+            reply_markup=kb_user(m.from_user.id),
         )
 
 @dp.message(Command("myid"))
@@ -630,8 +666,8 @@ async def myid(m: Message):
 async def request_access(cb: CallbackQuery):
     uid = cb.from_user.id
     ensure_user(uid)
-
     await cb.answer("Ок")
+
     created = create_access_request(uid)
     if not created:
         await cb.message.answer("⏳ У тебя уже есть активная заявка. Жди.", reply_markup=kb_user(uid))
@@ -647,7 +683,7 @@ async def request_access(cb: CallbackQuery):
         await bot.send_message(
             ADMIN_ID,
             f"🛂 Заявка на доступ от <code>{uid}</code>",
-            reply_markup=kb_admin_request(uid)
+            reply_markup=kb_admin_request(uid),
         )
     except Exception:
         pass
@@ -657,12 +693,10 @@ async def approve_cb(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("Нет доступа", show_alert=True)
         return
-
     parts = cb.data.split(":")
     if len(parts) != 3:
         await cb.answer("Ошибка", show_alert=True)
         return
-
     uid = int(parts[1])
     days = int(parts[2])
 
@@ -671,7 +705,6 @@ async def approve_cb(cb: CallbackQuery):
 
     await cb.answer("Одобрено ✅")
     await cb.message.answer(f"✅ Одобрено для <code>{uid}</code> на {days} дней (до {fmt_until(until)}).")
-
     try:
         await bot.send_message(uid, f"✅ Доступ выдан на {days} дней.\nДо: <b>{fmt_until(until)}</b>\nНажми /start")
     except Exception:
@@ -682,12 +715,10 @@ async def reject_cb(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("Нет доступа", show_alert=True)
         return
-
     parts = cb.data.split(":")
     if len(parts) != 2:
         await cb.answer("Ошибка", show_alert=True)
         return
-
     uid = int(parts[1])
     reject_user(uid)
 
@@ -715,7 +746,7 @@ async def toggle_auto(cb: CallbackQuery):
 
 def format_candidate(c: Candidate, idx: int) -> str:
     ok_enter = (c.prob >= ENTRY_MIN_PROB) and c.strict_ok
-    badge = "✅ ВХОД" if ok_enter else "⏳ ЖДАТЬ"
+    badge = "✅ <b>ВХОД</b>" if ok_enter else "⏳ <b>ЖДАТЬ</b>"
     return (
         f"<b>#{idx} {c.symbol}</b>  {badge}\n"
         f"Side: <b>{c.side}</b> | Prob: <b>{c.prob}/10</b> | Strict: <b>{'OK' if c.strict_ok else 'NO'}</b>\n"
@@ -733,25 +764,43 @@ async def sig_now(cb: CallbackQuery):
         return
 
     await cb.answer("Анализирую…")
-    msg = await cb.message.answer("⏳ Ищу лучший сетап по рынку…")
+    msg = await cb.message.answer("⏳ Первый проход (строго, только топ-ликвид)…")
 
     try:
-        syms = await top_symbols()
-        cands = await top_k_candidates(syms[:25], SHOW_TOP_K)
-        if len(cands) < SHOW_TOP_K:
-            more = await top_k_candidates(syms[25:], SHOW_TOP_K)
-            cands = (cands + more)
-            cands.sort(key=lambda x: x.prob, reverse=True)
-            cands = cands[:SHOW_TOP_K]
+        # Pass 1: strict universe + strict minima
+        syms1 = await top_symbols(MIN_QUOTE_VOL_STRICT, TOP_N_STRICT, "strict")
+        cands = await top_k_candidates(
+            syms1,
+            SHOW_TOP_K,
+            ATR_MIN_PCT,
+            VOL_RATIO_MIN,
+            OVERHEAT_DIST_MAX_PCT,
+        )
+
+        # If empty -> fallback pass (wider universe + relaxed minima), BUT entry rule unchanged
+        if not cands:
+            await msg.edit_text(f"Пока пусто по строгому проходу.\n\n😄 {joke(JOKES_FALLBACK)}")
+            syms2 = await top_symbols(MIN_QUOTE_VOL_FALLBACK, TOP_N_FALLBACK, "fallback")
+            cands = await top_k_candidates(
+                syms2,
+                SHOW_TOP_K,
+                ATR_MIN_PCT_FALLBACK,
+                VOL_RATIO_MIN_FALLBACK,
+                OVERHEAT_DIST_MAX_PCT_FALLBACK,
+            )
 
         if not cands:
             await msg.edit_text(f"Сейчас нет достойных кандидатов.\n\n😄 {joke(JOKES_NO)}")
             return
 
+        # Log + message
         best_strict = pick_best_strict(cands)
 
-        header = "📣 <b>Лучшие кандидаты (Top-3)</b>\n"
-        header += f"Вход разрешён если: <b>Prob ≥ {ENTRY_MIN_PROB}</b> и <b>Strict=OK</b>\n\n"
+        header = (
+            f"📣 <b>Лучшие кандидаты (Top-{SHOW_TOP_K})</b>\n"
+            f"✅ Вход = <b>Prob ≥ {ENTRY_MIN_PROB}</b> и <b>Strict=OK</b>\n"
+            f"⚠️ Если Strict=NO — это <b>наблюдение</b>, не сигнал на вход.\n\n"
+        )
 
         blocks = []
         for i, c in enumerate(cands, 1):
@@ -771,21 +820,23 @@ async def sig_now(cb: CallbackQuery):
         await msg.edit_text(f"Ошибка при получении данных (BingX/таймаут/лимит). Попробуй ещё раз через минуту.\n\n😄 {joke(JOKES_ERR)}")
 
 # =========================
-# AUTO SCAN LOOP
+# AUTO SCAN LOOP (STRICT ONLY)
 # =========================
 async def autoscan_loop():
     while True:
         try:
             users = approved_users_for_broadcast()
             if users:
-                syms = await top_symbols()
+                syms = await top_symbols(MIN_QUOTE_VOL_STRICT, TOP_N_STRICT, "strict")
 
-                cands = await top_k_candidates(syms[:35], SHOW_TOP_K)
-                if len(cands) < SHOW_TOP_K:
-                    more = await top_k_candidates(syms[35:], SHOW_TOP_K)
-                    cands = (cands + more)
-                    cands.sort(key=lambda x: x.prob, reverse=True)
-                    cands = cands[:SHOW_TOP_K]
+                # autoscan: strict minima ONLY
+                cands = await top_k_candidates(
+                    syms,
+                    SHOW_TOP_K,
+                    ATR_MIN_PCT,
+                    VOL_RATIO_MIN,
+                    OVERHEAT_DIST_MAX_PCT,
+                )
 
                 best = None
                 if cands:
@@ -797,7 +848,6 @@ async def autoscan_loop():
                     now = int(time.time())
                     if now - int(LAST_BROADCAST["ts"]) >= BROADCAST_COOLDOWN_SEC:
                         LAST_BROADCAST["ts"] = now
-
                         log_signal(0, best.symbol, best.side, best.entry, best.tp, best.sl, best.prob, 1, best.reason)
 
                         text = (
